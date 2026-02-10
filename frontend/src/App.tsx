@@ -20,7 +20,9 @@ type Campaign = {
   target_tools: string[];
   required_task: string;
   subsidy_per_call_cents: number;
+  budget_total_cents: number;
   budget_remaining_cents: number;
+  query_urls: string[];
   active: boolean;
   created_at: string;
 };
@@ -57,6 +59,46 @@ type CampaignForm = {
   budget_cents: number;
 };
 
+type SponsoredApi = {
+  id: string;
+  name: string;
+  sponsor: string;
+  description: string | null;
+  upstream_url: string;
+  upstream_method: string;
+  price_cents: number;
+  budget_total_cents: number;
+  budget_remaining_cents: number;
+  active: boolean;
+  created_at: string;
+};
+
+type PaymentRequired = {
+  service: string;
+  amount_cents: number;
+  accepted_header: string;
+  payment_required: string;
+  message: string;
+  next_step: string;
+};
+
+type ServiceRunResponse = {
+  service: string;
+  output: string;
+  payment_mode: string;
+  sponsored_by: string | null;
+  tx_hash: string | null;
+};
+
+type SponsoredApiRunResponse = {
+  api_id: string;
+  payment_mode: string;
+  sponsored_by: string | null;
+  tx_hash: string | null;
+  upstream_status: number;
+  upstream_body: string;
+};
+
 const defaultCampaignForm: CampaignForm = {
   name: "",
   sponsor: "",
@@ -82,8 +124,20 @@ function App() {
   });
   const [isLoggedIn, setIsLoggedIn] = useState(false); // Start logged out (public dashboard)
   const [showProfile, setShowProfile] = useState(false);
-  const [currentView, setCurrentView] = useState<"dashboard" | "create-campaign" | "login">("dashboard");
+  const [currentView, setCurrentView] = useState<"dashboard" | "create-campaign" | "login" | "caller">("dashboard");
   const [loginForm, setLoginForm] = useState({ email: "", password: "" });
+  const [sponsoredApis, setSponsoredApis] = useState<SponsoredApi[]>([]);
+  const [callerLoading, setCallerLoading] = useState(false);
+  const [callerResult, setCallerResult] = useState<any>(null);
+  const [callerError, setCallerError] = useState<string | null>(null);
+  const [callerForm, setCallerForm] = useState({
+    callType: "proxy" as "proxy" | "tool" | "sponsored-api",
+    service: "",
+    apiId: "",
+    input: "",
+    userId: ""
+  });
+  const [paymentRequired, setPaymentRequired] = useState<PaymentRequired | null>(null);
 
   async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
     const response = await fetch(`/api${path}`, {
@@ -134,7 +188,17 @@ function App() {
 
   useEffect(() => {
     void loadDashboard(true); // Silent mode - don't show errors on initial load
+    void loadSponsoredApis();
   }, []);
+
+  async function loadSponsoredApis() {
+    try {
+      const apis = await fetchJson<SponsoredApi[]>("/sponsored-apis", { method: "GET" });
+      setSponsoredApis(apis);
+    } catch (err) {
+      // Silent fail
+    }
+  }
 
   useEffect(() => {
     localStorage.setItem("darkMode", JSON.stringify(darkMode));
@@ -263,7 +327,7 @@ function App() {
       0
     );
     const totalPayouts = campaigns.reduce(
-      (acc, item) => acc + (item.budget_cents || 0) - item.budget_remaining_cents,
+      (acc, item) => acc + item.budget_total_cents - item.budget_remaining_cents,
       0
     );
 
@@ -300,6 +364,129 @@ function App() {
       setError(err instanceof Error ? err.message : "Unknown error");
     } finally {
       setCreateLoading(false);
+    }
+  }
+
+  async function handleApiCall(paymentSignature?: string) {
+    setCallerLoading(true);
+    setCallerError(null);
+    setCallerResult(null);
+    setPaymentRequired(null);
+
+    try {
+      const userId = callerForm.userId || localStorage.getItem("walletAddress") || "00000000-0000-0000-0000-000000000000";
+      let path = "";
+      let body: any = {};
+
+      if (callerForm.callType === "sponsored-api") {
+        if (!callerForm.apiId) {
+          throw new Error("Please select a sponsored API");
+        }
+        path = `/sponsored-apis/${callerForm.apiId}/run`;
+        body = {
+          caller: userId,
+          input: callerForm.input ? JSON.parse(callerForm.input) : {}
+        };
+      } else {
+        if (!callerForm.service) {
+          throw new Error("Please enter a service name");
+        }
+        path = `/${callerForm.callType}/${callerForm.service}/run`;
+        body = {
+          user_id: userId,
+          input: callerForm.input || ""
+        };
+      }
+
+      const headers: Record<string, string> = {
+        "content-type": "application/json"
+      };
+
+      if (paymentSignature) {
+        headers["payment-signature"] = paymentSignature;
+      }
+
+      const response = await fetch(`/api${path}`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body)
+      });
+
+      if (response.status === 402) {
+        // Payment required
+        const paymentData = await response.json();
+        setPaymentRequired(paymentData);
+        setCallerError("Payment required to access this service");
+        return;
+      }
+
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(errorText || `Request failed (${response.status})`);
+      }
+
+      const result = await response.json();
+      setCallerResult(result);
+      setPaymentRequired(null);
+    } catch (err) {
+      setCallerError(err instanceof Error ? err.message : "Unknown error");
+    } finally {
+      setCallerLoading(false);
+    }
+  }
+
+  async function handlePayment() {
+    if (!paymentRequired) return;
+
+    try {
+      // Decode payment requirement
+      const paymentReqBase64 = paymentRequired.payment_required;
+      const paymentReqJson = atob(paymentReqBase64);
+      const paymentReqs = JSON.parse(paymentReqJson);
+      const paymentReq = paymentReqs[0]; // X402PaymentRequirement
+
+      if (typeof window.ethereum === "undefined") {
+        setCallerError("Please install MetaMask or another Web3 wallet to make payments");
+        return;
+      }
+
+      // Request account access
+      const accounts = await window.ethereum.request({
+        method: "eth_requestAccounts"
+      });
+
+      if (accounts.length === 0) {
+        setCallerError("No wallet accounts found");
+        return;
+      }
+
+      const address = accounts[0];
+
+      // Create payment signature using X402 protocol
+      // For now, we'll use a simplified approach - in production, you'd use the X402 SDK
+      const message = `Pay ${paymentReq.maxAmountRequired} ${paymentReq.asset} to ${paymentReq.payTo} for ${paymentReq.description}`;
+      const messageHex = "0x" + Array.from(new TextEncoder().encode(message))
+        .map(b => b.toString(16).padStart(2, "0"))
+        .join("");
+
+      const signature = await window.ethereum.request({
+        method: "personal_sign",
+        params: [messageHex, address]
+      });
+
+      if (!signature) {
+        setCallerError("Payment signature required");
+        return;
+      }
+
+      // Retry API call with payment signature
+      await handleApiCall(signature);
+    } catch (err: any) {
+      if (err.code === 4001) {
+        setCallerError("Payment request rejected");
+      } else {
+        setCallerError(err.message || "Failed to process payment");
+      }
     }
   }
 
@@ -589,7 +776,294 @@ function App() {
             </div>
           </div>
         </main>
+      ) : currentView === "caller" ? (
+        /* Caller Page */
+        <main className="main-content">
+          <div className="create-campaign-page">
+            <div className="page-header">
+              <button 
+                className="back-button-inline"
+                onClick={() => setCurrentView("dashboard")}
+                title="Back to dashboard"
+              >
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <path d="M19 12H5"></path>
+                  <path d="M12 19l-7-7 7-7"></path>
+                </svg>
+                Back to Dashboard
+              </button>
+              <h2>API Caller</h2>
+              <p>Call APIs and handle payments automatically</p>
+            </div>
+
+            <div className="card create-campaign-card">
+              <div className="card-content">
+                <form className="campaign-form" onSubmit={(e) => { e.preventDefault(); void handleApiCall(); }}>
+                  <div className="form-group">
+                    <label>Call Type</label>
+                    <select
+                      value={callerForm.callType}
+                      onChange={(e) => setCallerForm((prev) => ({ ...prev, callType: e.target.value as any }))}
+                    >
+                      <option value="proxy">Proxy Service</option>
+                      <option value="tool">Direct Tool</option>
+                      <option value="sponsored-api">Sponsored API</option>
+                    </select>
+                  </div>
+
+                  {callerForm.callType === "sponsored-api" ? (
+                    <div className="form-group">
+                      <label>Sponsored API</label>
+                      <select
+                        value={callerForm.apiId}
+                        onChange={(e) => setCallerForm((prev) => ({ ...prev, apiId: e.target.value }))}
+                      >
+                        <option value="">Select an API</option>
+                        {sponsoredApis.map((api) => (
+                          <option key={api.id} value={api.id}>
+                            {api.name} - ${(api.price_cents / 100).toFixed(2)} per call
+                            {api.active && api.budget_remaining_cents > 0 ? " (Sponsored)" : " (Paid)"}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  ) : (
+                    <div className="form-group">
+                      <label>Service Name</label>
+                      <input
+                        required
+                        value={callerForm.service}
+                        onChange={(e) => setCallerForm((prev) => ({ ...prev, service: e.target.value }))}
+                        placeholder="e.g., scraping, design, storage"
+                      />
+                    </div>
+                  )}
+
+                  <div className="form-group">
+                    <label>User ID (optional, defaults to wallet address)</label>
+                    <input
+                      value={callerForm.userId}
+                      onChange={(e) => setCallerForm((prev) => ({ ...prev, userId: e.target.value }))}
+                      placeholder="Leave empty to use wallet address"
+                    />
+                  </div>
+
+                  <div className="form-group">
+                    <label>Input {callerForm.callType === "sponsored-api" ? "(JSON)" : "(text)"}</label>
+                    <textarea
+                      rows={6}
+                      value={callerForm.input}
+                      onChange={(e) => setCallerForm((prev) => ({ ...prev, input: e.target.value }))}
+                      placeholder={callerForm.callType === "sponsored-api" ? '{"key": "value"}' : "Enter input text"}
+                    />
+                  </div>
+
+                  {paymentRequired && (
+                    <div className="payment-required-box">
+                      <div className="payment-header">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                          <circle cx="12" cy="12" r="10"></circle>
+                          <line x1="12" y1="8" x2="12" y2="12"></line>
+                          <line x1="12" y1="16" x2="12.01" y2="16"></line>
+                        </svg>
+                        <h4>Payment Required</h4>
+                      </div>
+                      <div className="payment-details">
+                        <p><strong>Service:</strong> {paymentRequired.service}</p>
+                        <p><strong>Amount:</strong> ${(paymentRequired.amount_cents / 100).toFixed(2)}</p>
+                        <p><strong>Message:</strong> {paymentRequired.message}</p>
+                        <p><strong>Next Step:</strong> {paymentRequired.next_step}</p>
+                      </div>
+                      <button
+                        type="button"
+                        className="wallet-login-btn"
+                        onClick={handlePayment}
+                        disabled={callerLoading}
+                      >
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                          <rect x="1" y="4" width="22" height="16" rx="2" ry="2"></rect>
+                          <line x1="1" y1="10" x2="23" y2="10"></line>
+                        </svg>
+                        Pay with Wallet
+                      </button>
+                    </div>
+                  )}
+
+                  {callerError && <div className="error-message">{callerError}</div>}
+
+                  <button type="submit" className="submit-btn" disabled={callerLoading}>
+                    {callerLoading ? "Calling..." : "Call API"}
+                  </button>
+                </form>
+
+                {callerResult && (
+                  <div className="caller-result">
+                    <h4>Result</h4>
+                    <div className="result-box">
+                      <pre>{JSON.stringify(callerResult, null, 2)}</pre>
+                    </div>
+                    {callerResult.payment_mode && (
+                      <div className="payment-info">
+                        <p><strong>Payment Mode:</strong> {callerResult.payment_mode}</p>
+                        {callerResult.sponsored_by && (
+                          <p><strong>Sponsored By:</strong> {callerResult.sponsored_by}</p>
+                        )}
+                        {callerResult.tx_hash && (
+                          <p><strong>Transaction Hash:</strong> {callerResult.tx_hash}</p>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        </main>
+      ) : currentView === "caller" ? (
+        /* Caller Page */
+        <main className="main-content">
+          <div className="create-campaign-page">
+            <div className="page-header">
+              <button 
+                className="back-button-inline"
+                onClick={() => setCurrentView("dashboard")}
+                title="Back to dashboard"
+              >
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <path d="M19 12H5"></path>
+                  <path d="M12 19l-7-7 7-7"></path>
+                </svg>
+                Back to Dashboard
+              </button>
+              <h2>API Caller</h2>
+              <p>Call APIs and handle payments automatically</p>
+            </div>
+
+            <div className="card create-campaign-card">
+              <div className="card-content">
+                <form className="campaign-form" onSubmit={(e) => { e.preventDefault(); void handleApiCall(); }}>
+                  <div className="form-group">
+                    <label>Call Type</label>
+                    <select
+                      value={callerForm.callType}
+                      onChange={(e) => setCallerForm((prev) => ({ ...prev, callType: e.target.value as any }))}
+                    >
+                      <option value="proxy">Proxy Service</option>
+                      <option value="tool">Direct Tool</option>
+                      <option value="sponsored-api">Sponsored API</option>
+                    </select>
+                  </div>
+
+                  {callerForm.callType === "sponsored-api" ? (
+                    <div className="form-group">
+                      <label>Sponsored API</label>
+                      <select
+                        value={callerForm.apiId}
+                        onChange={(e) => setCallerForm((prev) => ({ ...prev, apiId: e.target.value }))}
+                      >
+                        <option value="">Select an API</option>
+                        {sponsoredApis.map((api) => (
+                          <option key={api.id} value={api.id}>
+                            {api.name} - ${(api.price_cents / 100).toFixed(2)} per call
+                            {api.active && api.budget_remaining_cents > 0 ? " (Sponsored)" : " (Paid)"}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  ) : (
+                    <div className="form-group">
+                      <label>Service Name</label>
+                      <input
+                        required
+                        value={callerForm.service}
+                        onChange={(e) => setCallerForm((prev) => ({ ...prev, service: e.target.value }))}
+                        placeholder="e.g., scraping, design, storage"
+                      />
+                    </div>
+                  )}
+
+                  <div className="form-group">
+                    <label>User ID (optional, defaults to wallet address)</label>
+                    <input
+                      value={callerForm.userId}
+                      onChange={(e) => setCallerForm((prev) => ({ ...prev, userId: e.target.value }))}
+                      placeholder="Leave empty to use wallet address"
+                    />
+                  </div>
+
+                  <div className="form-group">
+                    <label>Input {callerForm.callType === "sponsored-api" ? "(JSON)" : "(text)"}</label>
+                    <textarea
+                      rows={6}
+                      value={callerForm.input}
+                      onChange={(e) => setCallerForm((prev) => ({ ...prev, input: e.target.value }))}
+                      placeholder={callerForm.callType === "sponsored-api" ? '{"key": "value"}' : "Enter input text"}
+                    />
+                  </div>
+
+                  {paymentRequired && (
+                    <div className="payment-required-box">
+                      <div className="payment-header">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                          <circle cx="12" cy="12" r="10"></circle>
+                          <line x1="12" y1="8" x2="12" y2="12"></line>
+                          <line x1="12" y1="16" x2="12.01" y2="16"></line>
+                        </svg>
+                        <h4>Payment Required</h4>
+                      </div>
+                      <div className="payment-details">
+                        <p><strong>Service:</strong> {paymentRequired.service}</p>
+                        <p><strong>Amount:</strong> ${(paymentRequired.amount_cents / 100).toFixed(2)}</p>
+                        <p><strong>Message:</strong> {paymentRequired.message}</p>
+                        <p><strong>Next Step:</strong> {paymentRequired.next_step}</p>
+                      </div>
+                      <button
+                        type="button"
+                        className="wallet-login-btn"
+                        onClick={handlePayment}
+                        disabled={callerLoading}
+                      >
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                          <rect x="1" y="4" width="22" height="16" rx="2" ry="2"></rect>
+                          <line x1="1" y1="10" x2="23" y2="10"></line>
+                        </svg>
+                        Pay with Wallet
+                      </button>
+                    </div>
+                  )}
+
+                  {callerError && <div className="error-message">{callerError}</div>}
+
+                  <button type="submit" className="submit-btn" disabled={callerLoading}>
+                    {callerLoading ? "Calling..." : "Call API"}
+                  </button>
+                </form>
+
+                {callerResult && (
+                  <div className="caller-result">
+                    <h4>Result</h4>
+                    <div className="result-box">
+                      <pre>{JSON.stringify(callerResult, null, 2)}</pre>
+                    </div>
+                    {callerResult.payment_mode && (
+                      <div className="payment-info">
+                        <p><strong>Payment Mode:</strong> {callerResult.payment_mode}</p>
+                        {callerResult.sponsored_by && (
+                          <p><strong>Sponsored By:</strong> {callerResult.sponsored_by}</p>
+                        )}
+                        {callerResult.tx_hash && (
+                          <p><strong>Transaction Hash:</strong> {callerResult.tx_hash}</p>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        </main>
       ) : (
+        /* Dashboard */
         <main className="main-content">
           <div className="dashboard-grid">
           {/* Sales Ratings Card */}
@@ -891,6 +1365,16 @@ function App() {
                 </svg>
                 Create Campaign
               </button>
+              <button 
+                className="primary-btn" 
+                onClick={() => setCurrentView("caller")}
+                style={{ marginLeft: "8px" }}
+              >
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+                  <path d="M22 16.92v3a2 2 0 0 1-2.18 2 19.79 19.79 0 0 1-8.63-3.07 19.5 19.5 0 0 1-6-6 19.79 19.79 0 0 1-3.07-8.67A2 2 0 0 1 4.11 2h3a2 2 0 0 1 2 1.72 12.84 12.84 0 0 0 .7 2.81 2 2 0 0 1-.45 2.11L8.09 9.91a16 16 0 0 0 6 6l1.27-1.27a2 2 0 0 1 2.11-.45 12.84 12.84 0 0 0 2.81.7A2 2 0 0 1 22 16.92z"></path>
+                </svg>
+                API Caller
+              </button>
               <button className="ghost-btn" onClick={() => void loadDashboard(false)}>
                 Refresh
               </button>
@@ -1015,7 +1499,7 @@ function App() {
             </div>
             </div>
           )}
-      </main>
+        </main>
       )}
     </div>
   );
