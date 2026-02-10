@@ -16,10 +16,27 @@ Minimal full-stack MVP for a sponsored x402-style payment flow:
 
 - Rust + `axum`
 - React + Vite + TypeScript
-- In-memory state (`RwLock<HashMap<...>>`)
+- PostgreSQL (`sqlx`) + SQL migrations
 - Prometheus metrics (`/metrics`)
 
 ## Run Backend
+
+Start Postgres:
+
+```bash
+docker compose -f docker-compose.postgres.yml up -d
+```
+
+Set env:
+
+```bash
+export DATABASE_URL=postgres://postgres:postgres@localhost:5432/payloadexchange
+export TESTNET_RPC_URL=https://your-testnet-rpc.example
+export TESTNET_CONFIRMED_TX_HASH=0x<confirmed_testnet_tx_hash>
+export TESTNET_FAILED_TX_HASH=0x<failed_testnet_tx_hash>
+```
+
+Run app:
 
 ```bash
 cargo run
@@ -53,6 +70,20 @@ Hard enforcement rule for other agents:
 
 ```bash
 curl -s -X POST http://localhost:3000/profiles \
+  -H 'content-type: application/json' \
+  -d '{
+    "email":"dev@example.com",
+    "region":"US",
+    "roles":["developer"],
+    "tools_used":["scraping","storage"],
+    "attributes":{"experience":"indie"}
+  }'
+```
+
+Use Postgres-backed registration endpoint:
+
+```bash
+curl -s -X POST http://localhost:3000/register \
   -H 'content-type: application/json' \
   -d '{
     "email":"dev@example.com",
@@ -103,9 +134,9 @@ curl -s -X POST http://localhost:3000/proxy/scraping/run \
 5. Direct user payment flow (no sponsor)
 
 ```bash
-curl -s -X POST http://localhost:3000/payments/mock/direct \
+curl -s -X POST http://localhost:3000/payments/testnet/direct \
   -H 'content-type: application/json' \
-  -d '{"payer":"dev@example.com","service":"design"}'
+  -d '{"payer":"dev@example.com","service":"design","tx_hash":"0x<TESTNET_TX_HASH>"}'
 ```
 
 Use returned `payment_signature` as `payment-signature` header:
@@ -143,6 +174,17 @@ Prometheus scrape:
 
 ```bash
 curl -s http://localhost:3000/metrics
+```
+
+## Testnet Tests (No Mock)
+
+Tests in `src/test.rs` call the real testnet verification path and require RPC + real tx hashes:
+
+```bash
+export TESTNET_RPC_URL=https://your-testnet-rpc.example
+export TESTNET_CONFIRMED_TX_HASH=0x<confirmed_testnet_tx_hash>
+export TESTNET_FAILED_TX_HASH=0x<failed_testnet_tx_hash>
+cargo test testnet_ -- --nocapture
 ```
 
 ## x402scan: Does It Help?

@@ -55,11 +55,6 @@ pub async fn fetch_latest_block_number(http: &reqwest::Client, rpc_url: &str) ->
 }
 
 async fn rpc_call(http: &reqwest::Client, rpc_url: &str, payload: Value) -> ApiResult<Value> {
-    #[cfg(test)]
-    if let Some(value) = mock_testnet_rpc_response(rpc_url, &payload) {
-        return Ok(value);
-    }
-
     let response = http
         .post(rpc_url)
         .json(&payload)
@@ -95,45 +90,4 @@ async fn rpc_call(http: &reqwest::Client, rpc_url: &str, payload: Value) -> ApiR
 fn parse_hex_u64(value: &str) -> Option<u64> {
     let trimmed = value.trim_start_matches("0x");
     u64::from_str_radix(trimmed, 16).ok()
-}
-
-#[cfg(test)]
-fn mock_testnet_rpc_response(rpc_url: &str, payload: &Value) -> Option<Value> {
-    let encoded = rpc_url.strip_prefix("mock://")?;
-    let parts: Vec<&str> = encoded.split('/').collect();
-    if parts.len() != 3 {
-        return None;
-    }
-    let mode = parts[0];
-    let tx_block = parts[1].parse::<u64>().ok()?;
-    let latest = parts[2].parse::<u64>().ok()?;
-    let method = payload.get("method")?.as_str()?;
-
-    let response = match method {
-        "eth_getTransactionReceipt" => match mode {
-            "missing" => serde_json::json!({"jsonrpc":"2.0","id":1,"result":null}),
-            "fail" => serde_json::json!({
-                "jsonrpc":"2.0",
-                "id":1,
-                "result":{"status":"0x0","blockNumber":format!("0x{:x}", tx_block)}
-            }),
-            _ => serde_json::json!({
-                "jsonrpc":"2.0",
-                "id":1,
-                "result":{"status":"0x1","blockNumber":format!("0x{:x}", tx_block)}
-            }),
-        },
-        "eth_blockNumber" => serde_json::json!({
-            "jsonrpc":"2.0",
-            "id":2,
-            "result":format!("0x{:x}", latest)
-        }),
-        _ => serde_json::json!({
-            "jsonrpc":"2.0",
-            "id":99,
-            "error":{"code":-32601,"message":"method not found"}
-        }),
-    };
-
-    Some(response)
 }

@@ -108,19 +108,20 @@ body {
   display: flex;
   align-items: center;
   gap: 12px;
+  cursor: pointer;
+  transition: opacity 0.2s;
+}
+
+.logo:hover {
+  opacity: 0.8;
 }
 
 .logo-icon {
   width: 40px;
   height: 40px;
-  background: linear-gradient(135deg, var(--blue-primary), #3B82F6);
-  color: white;
   border-radius: 10px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-weight: 700;
-  font-size: 14px;
+  object-fit: contain;
+  display: block;
 }
 
 .logo-text {
@@ -723,13 +724,9 @@ body {
 .banner-logo {
   width: 48px;
   height: 48px;
-  background: rgba(255, 255, 255, 0.2);
   border-radius: 12px;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  font-weight: 700;
-  font-size: 20px;
+  object-fit: contain;
+  display: block;
   backdrop-filter: blur(10px);
 }
 
@@ -1124,19 +1121,20 @@ td {
   align-items: center;
   gap: 16px;
   margin-bottom: 16px;
+  cursor: pointer;
+  transition: opacity 0.2s;
+}
+
+.login-logo:hover {
+  opacity: 0.8;
 }
 
 .logo-icon-large {
   width: 64px;
   height: 64px;
-  background: linear-gradient(135deg, var(--blue-primary), var(--green-primary));
-  color: white;
   border-radius: 16px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-weight: 700;
-  font-size: 24px;
+  object-fit: contain;
+  display: block;
 }
 
 .login-logo h1 {

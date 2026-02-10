@@ -1,4 +1,16 @@
 import { FormEvent, useEffect, useMemo, useState } from "react";
+import logoImage from "./logo.jpg";
+
+// Extend Window interface for MetaMask
+declare global {
+  interface Window {
+    ethereum?: {
+      request: (args: { method: string; params?: any[] }) => Promise<any>;
+      isMetaMask?: boolean;
+      selectedAddress?: string;
+    };
+  }
+}
 
 type Campaign = {
   id: string;
@@ -90,9 +102,11 @@ function App() {
     return response.json() as Promise<T>;
   }
 
-  async function loadDashboard() {
+  async function loadDashboard(silent = false) {
     setLoading(true);
+    if (!silent) {
     setError(null);
+    }
 
     try {
       const [campaignData, profileData, creatorData] = await Promise.all([
@@ -104,14 +118,22 @@ function App() {
       setProfiles(profileData);
       setCreator(creatorData);
     } catch (err) {
+      // Only show error if not silent mode (for user-initiated actions)
+      if (!silent) {
       setError(err instanceof Error ? err.message : "Unknown error");
+      } else {
+        // Silent mode: just set empty data, don't show error
+        setCampaigns([]);
+        setProfiles([]);
+        setCreator(null);
+      }
     } finally {
       setLoading(false);
     }
   }
 
   useEffect(() => {
-    void loadDashboard();
+    void loadDashboard(true); // Silent mode - don't show errors on initial load
   }, []);
 
   useEffect(() => {
@@ -152,17 +174,76 @@ function App() {
     setCurrentView("login"); // Show login page after logout
   };
 
-  const handleWalletConnect = () => {
-    // In production, this would connect to a wallet (MetaMask, WalletConnect, etc.)
-    // For now, just sign in
-    setIsLoggedIn(true);
-    localStorage.setItem("isLoggedIn", "true");
-    setShowProfile(true);
-    // If we were trying to create a campaign, go there after login
-    if (currentView === "login") {
-      setCurrentView("create-campaign");
-    } else {
-      setCurrentView("dashboard");
+  const handleWalletConnect = async () => {
+    setError(null);
+    
+    try {
+      // Check if MetaMask is installed
+      if (typeof window.ethereum === "undefined") {
+        setError("Please install MetaMask or another Web3 wallet to continue");
+        return;
+      }
+
+      // Request account access
+      const accounts = await window.ethereum.request({
+        method: "eth_requestAccounts"
+      });
+
+      if (accounts.length === 0) {
+        setError("No wallet accounts found. Please connect your wallet.");
+        return;
+      }
+
+      // Get the connected address
+      const address = accounts[0];
+      console.log("Connected wallet:", address);
+
+      // Create a message to sign for authentication
+      const message = `Sign in to PayloadExchange\n\nWallet: ${address}\nTimestamp: ${Date.now()}`;
+      
+      // Convert message to hex (browser-compatible)
+      const messageHex = "0x" + Array.from(new TextEncoder().encode(message))
+        .map(b => b.toString(16).padStart(2, "0"))
+        .join("");
+      
+      // Request signature for authentication
+      const signature = await window.ethereum.request({
+        method: "personal_sign",
+        params: [messageHex, address]
+      });
+
+      if (!signature) {
+        setError("Signature required for authentication. Please sign the message.");
+        return;
+      }
+
+      console.log("Signature received:", signature);
+
+      // Now sign in after successful wallet connection AND signature
+      setIsLoggedIn(true);
+      localStorage.setItem("isLoggedIn", "true");
+      localStorage.setItem("walletAddress", address);
+      localStorage.setItem("walletSignature", signature);
+      setShowProfile(true);
+      
+      // If we were trying to create a campaign, go there after login
+      if (currentView === "login") {
+        setCurrentView("create-campaign");
+      } else {
+        setCurrentView("dashboard");
+      }
+      
+      // Load dashboard data silently in background (don't show errors)
+      void loadDashboard(true);
+    } catch (err: any) {
+      // Handle user rejection or other errors
+      if (err.code === 4001) {
+        setError("Request rejected. Please connect and sign to continue.");
+      } else if (err.code === -32602) {
+        setError("Invalid signature request. Please try again.");
+      } else {
+        setError(err.message || "Failed to connect wallet. Please try again.");
+      }
     }
   };
 
@@ -211,9 +292,10 @@ function App() {
         })
       });
       setForm(defaultCampaignForm);
-      await loadDashboard();
       // Go back to dashboard after successful creation
       setCurrentView("dashboard");
+      // Reload dashboard data silently
+      void loadDashboard(true);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Unknown error");
     } finally {
@@ -236,8 +318,8 @@ function App() {
     <div className="dashboard">
       <header className="header">
         <div className="header-left">
-          <div className="logo">
-            <span className="logo-icon">PX</span>
+          <div className="logo" onClick={() => setCurrentView("dashboard")} style={{ cursor: "pointer" }}>
+            <img src={logoImage} alt="PayloadExchange" className="logo-icon" />
             <span className="logo-text">PayloadExchange</span>
           </div>
         </div>
@@ -323,8 +405,8 @@ function App() {
           <div className="login-container">
             <div className="login-card">
               <div className="login-header">
-                <div className="login-logo">
-                  <div className="logo-icon-large">PX</div>
+                <div className="login-logo" onClick={() => setCurrentView("dashboard")}>
+                  <img src={logoImage} alt="PayloadExchange" className="logo-icon-large" />
                   <h1>PayloadExchange</h1>
                 </div>
                 <p className="login-subtitle">Sign in to manage your campaigns</p>
@@ -719,7 +801,7 @@ function App() {
               <div className="banner-text">
                 <div className="banner-vertical">UNLOCK YOUR GROWTH</div>
                 <h2>Power Your Business with Sponsored Compute Insights!</h2>
-                <div className="banner-logo">PX</div>
+                <img src={logoImage} alt="PayloadExchange" className="banner-logo" />
               </div>
             </div>
           </div>
@@ -809,7 +891,7 @@ function App() {
                 </svg>
                 Create Campaign
               </button>
-              <button className="ghost-btn" onClick={() => void loadDashboard()}>
+              <button className="ghost-btn" onClick={() => void loadDashboard(false)}>
                 Refresh
               </button>
             </div>

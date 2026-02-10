@@ -1,10 +1,9 @@
-use crate::error::{ApiError, ApiResult};
-use axum::http::StatusCode;
 use chrono::{DateTime, Utc};
 use prometheus::{IntCounter, IntCounterVec, Opts, Registry};
 use reqwest::Client;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sqlx::{PgPool, postgres::PgPoolOptions};
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::sync::RwLock;
 use uuid::Uuid;
@@ -17,142 +16,14 @@ pub const SPONSORED_API_CREATE_SERVICE: &str = "sponsored-api-create";
 pub const SPONSORED_API_SERVICE_PREFIX: &str = "sponsored-api";
 pub const DEFAULT_SPONSORED_API_CREATE_PRICE_CENTS: u64 = 25;
 pub const DEFAULT_SPONSORED_API_TIMEOUT_SECS: u64 = 12;
-#[derive(Clone)]
-pub struct SupabaseClient {
-    pub base_url: String,
-    pub api_key: String,
-    pub http: Client,
-}
-
-impl SupabaseClient {
-    pub fn from_env(http: Client) -> Option<Self> {
-        let base_url = std::env::var("SUPABASE_URL").ok()?;
-        let api_key = std::env::var("SUPABASE_SERVICE_ROLE_KEY").ok()?;
-        Some(Self {
-            base_url: base_url.trim_end_matches('/').to_string(),
-            api_key,
-            http,
-        })
-    }
-
-    pub fn table_url(&self, table: &str) -> String {
-        format!("{}/rest/v1/{}", self.base_url, table)
-    }
-
-    pub fn authed(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        builder
-            .header("apikey", &self.api_key)
-            .header("Authorization", format!("Bearer {}", self.api_key))
-            .header("Content-Type", "application/json")
-            .header("Accept", "application/json")
-    }
-
-    pub async fn insert_one<T: Serialize + DeserializeOwned>(
-        &self,
-        table: &str,
-        value: &T,
-    ) -> ApiResult<T> {
-        let url = format!("{}?select=*", self.table_url(table));
-        let response = self
-            .authed(self.http.post(url))
-            .header("Prefer", "return=representation")
-            .json(value)
-            .send()
-            .await
-            .map_err(|err| ApiError::supabase(StatusCode::BAD_GATEWAY, err.to_string()))?;
-        let rows: Vec<T> = self.parse_json(response).await?;
-        rows.into_iter()
-            .next()
-            .ok_or_else(|| ApiError::supabase(StatusCode::BAD_GATEWAY, "insert returned no rows"))
-    }
-
-    pub async fn insert_void<T: Serialize>(&self, table: &str, value: &T) -> ApiResult<()> {
-        let url = self.table_url(table);
-        let response = self
-            .authed(self.http.post(url))
-            .header("Prefer", "return=minimal")
-            .json(value)
-            .send()
-            .await
-            .map_err(|err| ApiError::supabase(StatusCode::BAD_GATEWAY, err.to_string()))?;
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            return Err(ApiError::supabase(status, body));
-        }
-
-        Ok(())
-    }
-
-    pub async fn select_one<T: DeserializeOwned>(
-        &self,
-        table: &str,
-        filter: &str,
-    ) -> ApiResult<Option<T>> {
-        let url = format!("{}?{}&select=*", self.table_url(table), filter);
-        let response = self
-            .authed(self.http.get(url))
-            .send()
-            .await
-            .map_err(|err| ApiError::supabase(StatusCode::BAD_GATEWAY, err.to_string()))?;
-        let rows: Vec<T> = self.parse_json(response).await?;
-        Ok(rows.into_iter().next())
-    }
-
-    pub async fn select_many<T: DeserializeOwned>(
-        &self,
-        table: &str,
-        filter: Option<&str>,
-    ) -> ApiResult<Vec<T>> {
-        let url = match filter {
-            Some(filter) => format!("{}?{}&select=*", self.table_url(table), filter),
-            None => format!("{}?select=*", self.table_url(table)),
-        };
-        let response = self
-            .authed(self.http.get(url))
-            .send()
-            .await
-            .map_err(|err| ApiError::supabase(StatusCode::BAD_GATEWAY, err.to_string()))?;
-        self.parse_json(response).await
-    }
-
-    pub async fn update_one<T: DeserializeOwned>(
-        &self,
-        table: &str,
-        filter: &str,
-        payload: &Value,
-    ) -> ApiResult<Option<T>> {
-        let url = format!("{}?{}&select=*", self.table_url(table), filter);
-        let response = self
-            .authed(self.http.patch(url))
-            .header("Prefer", "return=representation")
-            .json(payload)
-            .send()
-            .await
-            .map_err(|err| ApiError::supabase(StatusCode::BAD_GATEWAY, err.to_string()))?;
-        let rows: Vec<T> = self.parse_json(response).await?;
-        Ok(rows.into_iter().next())
-    }
-
-    pub async fn parse_json<T: DeserializeOwned>(
-        &self,
-        response: reqwest::Response,
-    ) -> ApiResult<T> {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        if !status.is_success() {
-            return Err(ApiError::supabase(status, body));
-        }
-        serde_json::from_str(&body)
-            .map_err(|err| ApiError::supabase(status, format!("{err}: {body}")))
-    }
-}
+pub const DEFAULT_TESTNET_MIN_CONFIRMATIONS: u64 = 1;
 
 #[derive(Clone)]
 pub struct AppConfig {
     pub sponsored_api_create_price_cents: u64,
     pub sponsored_api_timeout_secs: u64,
+    pub testnet_rpc_url: Option<String>,
+    pub testnet_min_confirmations: u64,
 }
 
 impl AppConfig {
@@ -165,6 +36,11 @@ impl AppConfig {
             sponsored_api_timeout_secs: read_env_u64(
                 "SPONSORED_API_TIMEOUT_SECS",
                 DEFAULT_SPONSORED_API_TIMEOUT_SECS,
+            ),
+            testnet_rpc_url: std::env::var("TESTNET_RPC_URL").ok(),
+            testnet_min_confirmations: read_env_u64(
+                "TESTNET_MIN_CONFIRMATIONS",
+                DEFAULT_TESTNET_MIN_CONFIRMATIONS,
             ),
         }
     }
@@ -183,7 +59,7 @@ pub struct AppState {
     pub creator_events: Vec<CreatorEvent>,
     pub service_prices: HashMap<String, u64>,
     pub metrics: Metrics,
-    pub supabase: Option<SupabaseClient>,
+    pub db: Option<PgPool>,
     pub http: Client,
     pub config: AppConfig,
 }
@@ -262,7 +138,12 @@ impl AppState {
             .expect("http client should build");
 
         let config = AppConfig::from_env();
-        let supabase = SupabaseClient::from_env(http.clone());
+        let db = std::env::var("DATABASE_URL").ok().and_then(|url| {
+            PgPoolOptions::new()
+                .max_connections(10)
+                .connect_lazy(&url)
+                .ok()
+        });
 
         Self {
             users: HashMap::new(),
@@ -272,7 +153,7 @@ impl AppState {
             creator_events: Vec::new(),
             service_prices,
             metrics: Metrics::new(),
-            supabase,
+            db,
             http,
             config,
         }
@@ -286,13 +167,14 @@ impl AppState {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct UserProfile {
     pub id: Uuid,
     pub email: String,
     pub region: String,
     pub roles: Vec<String>,
     pub tools_used: Vec<String>,
+    #[sqlx(json)]
     pub attributes: HashMap<String, String>,
     pub created_at: DateTime<Utc>,
 }
@@ -420,16 +302,19 @@ pub struct PaymentSettlement {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct CreateDirectPaymentRequest {
+pub struct CreateTestnetPaymentRequest {
     pub payer: String,
     pub service: String,
+    pub tx_hash: String,
     pub amount_cents: Option<u64>,
+    pub min_confirmations: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
-pub struct DirectPaymentResponse {
+pub struct TestnetPaymentResponse {
     pub tx_hash: String,
     pub payment_signature: String,
+    pub confirmations: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -510,6 +395,48 @@ pub struct SponsoredApi {
     pub active: bool,
     pub service_key: String,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct SponsoredApiRow {
+    pub id: Uuid,
+    pub name: String,
+    pub sponsor: String,
+    pub description: Option<String>,
+    pub upstream_url: String,
+    pub upstream_method: String,
+    pub upstream_headers: sqlx::types::Json<HashMap<String, String>>,
+    pub price_cents: i64,
+    pub budget_total_cents: i64,
+    pub budget_remaining_cents: i64,
+    pub active: bool,
+    pub service_key: String,
+    pub created_at: DateTime<Utc>,
+}
+
+impl TryFrom<SponsoredApiRow> for SponsoredApi {
+    type Error = String;
+
+    fn try_from(value: SponsoredApiRow) -> Result<Self, Self::Error> {
+        Ok(Self {
+            id: value.id,
+            name: value.name,
+            sponsor: value.sponsor,
+            description: value.description,
+            upstream_url: value.upstream_url,
+            upstream_method: value.upstream_method,
+            upstream_headers: value.upstream_headers.0,
+            price_cents: u64::try_from(value.price_cents)
+                .map_err(|_| "price_cents must be non-negative".to_string())?,
+            budget_total_cents: u64::try_from(value.budget_total_cents)
+                .map_err(|_| "budget_total_cents must be non-negative".to_string())?,
+            budget_remaining_cents: u64::try_from(value.budget_remaining_cents)
+                .map_err(|_| "budget_remaining_cents must be non-negative".to_string())?,
+            active: value.active,
+            service_key: value.service_key,
+            created_at: value.created_at,
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]

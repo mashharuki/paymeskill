@@ -79,8 +79,9 @@ pub fn verify_payment_proof(
             amount_cents: price,
             accepted_header: PAYMENT_SIGNATURE_HEADER.to_string(),
             message: "missing payment proof".to_string(),
-            next_step: "call /payments/mock/direct first, then retry with payment-signature header"
-                .to_string(),
+            next_step:
+                "call /payments/testnet/direct first, then retry with payment-signature header"
+                    .to_string(),
         }));
     };
 
@@ -90,7 +91,7 @@ pub fn verify_payment_proof(
             amount_cents: price,
             accepted_header: PAYMENT_SIGNATURE_HEADER.to_string(),
             message: format!("invalid payment proof: {err}"),
-            next_step: "regenerate payment signature via /payments/mock/direct".to_string(),
+            next_step: "regenerate payment signature via /payments/testnet/direct".to_string(),
         })
     })?;
 
@@ -133,7 +134,7 @@ pub fn verify_payment_proof(
             accepted_header: PAYMENT_SIGNATURE_HEADER.to_string(),
             message: "payment tx hash not found in ledger".to_string(),
             next_step:
-                "register payment via /payments/mock/direct or /webhooks/x402scan/settlement"
+                "register payment via /payments/testnet/direct or /webhooks/x402scan/settlement"
                     .to_string(),
         })),
     }

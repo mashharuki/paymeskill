@@ -1,6 +1,6 @@
 ---
 name: payloadexchange-operator
-description: Operate sponsored x402-style campaigns for developer tools, including profile onboarding, sponsor campaign setup, task gating, proxy-paid usage, and creator telemetry logging. Use when users need to run or monitor PayloadExchange MVP flows and skill performance metrics.
+description: Operate sponsored APIs and x402-style campaigns for PayloadExchange, including profile onboarding, sponsor campaign setup, task gating, sponsored API creation, proxy-paid usage, and creator telemetry logging.
 ---
 
 # PayloadExchange Operator
@@ -8,12 +8,20 @@ description: Operate sponsored x402-style campaigns for developer tools, includi
 ## Workflow
 
 1. Start the Rust API service.
-2. Create user profiles with role/tool attributes.
-3. Create sponsor campaigns with target roles, target tools, task gate, and budget.
-4. Record sponsor task completion before allowing proxy-sponsored usage.
-5. Use `/proxy/:service/run` for sponsored flows and `/tool/:service/run` for direct paid flows.
-6. Log skill usage outcomes to `/creator/metrics/event`.
-7. Read `/creator/metrics` and `/metrics` for operational monitoring.
+2. If using sponsored APIs, ensure Postgres is configured (`DATABASE_URL`) and migrations are applied.
+3. Create user profiles with role/tool attributes.
+4. Create sponsor campaigns with target roles, target tools, task gate, and budget.
+5. Record sponsor task completion before allowing proxy-sponsored usage.
+6. Create sponsored APIs via `POST /sponsored-apis`.
+7. If `SPONSORED_API_CREATE_PRICE_CENTS` > 0, pay for creation first using `/payments/testnet/direct` with `service: "sponsored-api-create"` and a testnet `tx_hash`.
+8. Call sponsored APIs via `POST /sponsored-apis/:api_id/run`. Calls are free while `budget_remaining_cents` covers the per-call price; once exhausted, pay with the returned `service_key` and retry with `payment-signature`.
+9. Use `/proxy/:service/run` for sponsored campaign flows and `/tool/:service/run` for direct paid flows.
+10. Log skill usage outcomes to `/creator/metrics/event`.
+11. Read `/creator/metrics` and `/metrics` for operational monitoring.
+
+## Sponsored API Tracking
+
+Each sponsored API call inserts a row into `sponsored_api_calls` with payment mode, amount, and caller metadata for budget reconciliation.
 
 ## Metric Event Contract
 

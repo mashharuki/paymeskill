@@ -34,8 +34,8 @@ pub enum ApiError {
         code: String,
         message: String,
     },
-    #[error("supabase error: {message}")]
-    Supabase { status: StatusCode, message: String },
+    #[error("database error: {message}")]
+    Database { status: StatusCode, message: String },
     #[error("upstream error: {message}")]
     Upstream { status: StatusCode, message: String },
     #[error("config error: {message}")]
@@ -69,8 +69,8 @@ impl ApiError {
         }
     }
 
-    pub fn supabase(status: StatusCode, message: impl Into<String>) -> Self {
-        Self::Supabase {
+    pub fn database(status: StatusCode, message: impl Into<String>) -> Self {
+        Self::Database {
             status,
             message: message.into(),
         }
@@ -99,7 +99,7 @@ impl ApiError {
         match self {
             Self::PaymentRequired(_) => StatusCode::PAYMENT_REQUIRED,
             Self::Http { status, .. } => *status,
-            Self::Supabase { status, .. } => *status,
+            Self::Database { status, .. } => *status,
             Self::Upstream { status, .. } => *status,
             Self::Config { .. } | Self::Internal { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -117,8 +117,8 @@ impl ApiError {
                 message: message.clone(),
                 details: None,
             },
-            Self::Supabase { message, .. } => ErrorBody {
-                code: "supabase_error".to_string(),
+            Self::Database { message, .. } => ErrorBody {
+                code: "database_error".to_string(),
                 message: message.clone(),
                 details: None,
             },

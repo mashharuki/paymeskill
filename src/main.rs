@@ -1,4 +1,5 @@
 mod error;
+mod onchain;
 mod types;
 mod utils;
 
@@ -11,15 +12,43 @@ use axum::{
 };
 use chrono::Utc;
 use prometheus::{Encoder, TextEncoder};
-use serde_json::json;
+use sqlx::types::Json as DbJson;
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 use tokio::sync::RwLock;
 use tracing::info;
 use uuid::Uuid;
 
 use crate::error::{ApiError, ApiResult};
+use crate::onchain::{fetch_latest_block_number, fetch_tx_block_number};
 use crate::types::*;
 use crate::utils::*;
+
+fn build_app(state: SharedState) -> Router {
+    Router::new()
+        .route("/health", get(health))
+        .route("/profiles", post(create_profile).get(list_profiles))
+        .route("/register", post(register_user))
+        .route("/campaigns", post(create_campaign).get(list_campaigns))
+        .route("/tasks/complete", post(complete_task))
+        .route("/tool/:service/run", post(run_tool))
+        .route("/proxy/:service/run", post(run_proxy))
+        .route(
+            "/sponsored-apis",
+            post(create_sponsored_api).get(list_sponsored_apis),
+        )
+        .route("/sponsored-apis/:api_id", get(get_sponsored_api))
+        .route("/sponsored-apis/:api_id/run", post(run_sponsored_api))
+        .route("/payments/testnet/direct", post(testnet_direct_payment))
+        .route(
+            "/webhooks/x402scan/settlement",
+            post(ingest_x402scan_settlement),
+        )
+        .route("/dashboard/sponsor/:campaign_id", get(sponsor_dashboard))
+        .route("/creator/metrics/event", post(record_creator_metric_event))
+        .route("/creator/metrics", get(creator_metrics))
+        .route("/metrics", get(prometheus_metrics))
+        .with_state(state)
+}
 
 #[tokio::main]
 async fn main() {
@@ -36,30 +65,17 @@ async fn main() {
         inner: Arc::new(RwLock::new(AppState::new())),
     };
 
-    let app = Router::new()
-        .route("/health", get(health))
-        .route("/profiles", post(create_profile).get(list_profiles))
-        .route("/register", post(register_user))
-        .route("/campaigns", post(create_campaign).get(list_campaigns))
-        .route("/tasks/complete", post(complete_task))
-        .route("/tool/:service/run", post(run_tool))
-        .route("/proxy/:service/run", post(run_proxy))
-        .route(
-            "/sponsored-apis",
-            post(create_sponsored_api).get(list_sponsored_apis),
-        )
-        .route("/sponsored-apis/:api_id", get(get_sponsored_api))
-        .route("/sponsored-apis/:api_id/run", post(run_sponsored_api))
-        .route("/payments/mock/direct", post(mock_direct_payment))
-        .route(
-            "/webhooks/x402scan/settlement",
-            post(ingest_x402scan_settlement),
-        )
-        .route("/dashboard/sponsor/:campaign_id", get(sponsor_dashboard))
-        .route("/creator/metrics/event", post(record_creator_metric_event))
-        .route("/creator/metrics", get(creator_metrics))
-        .route("/metrics", get(prometheus_metrics))
-        .with_state(state);
+    if let Some(db) = {
+        let state = state.inner.read().await;
+        state.db.clone()
+    } {
+        sqlx::migrate!("./migrations")
+            .run(&db)
+            .await
+            .expect("database migrations should run");
+    }
+
+    let app = build_app(state);
 
     let port = std::env::var("PORT")
         .ok()
@@ -135,15 +151,11 @@ async fn register_user(
     };
 
     let result: ApiResult<(StatusCode, Json<UserProfile>)> = async {
-        let supabase = {
+        let db = {
             let state = state.inner.read().await;
-            state.supabase.clone()
+            state.db.clone()
         }
-        .ok_or_else(|| {
-            ApiError::config(
-                "Supabase not configured; set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY",
-            )
-        })?;
+        .ok_or_else(|| ApiError::config("Postgres not configured; set DATABASE_URL"))?;
 
         if payload.email.trim().is_empty() {
             return Err(ApiError::validation("email is required"));
@@ -163,7 +175,24 @@ async fn register_user(
             created_at: Utc::now(),
         };
 
-        let inserted = supabase.insert_one("users", &profile).await?;
+        let inserted = sqlx::query_as::<_, UserProfile>(
+            r#"
+            insert into users (id, email, region, roles, tools_used, attributes, created_at)
+            values ($1, $2, $3, $4, $5, $6, $7)
+            returning id, email, region, roles, tools_used, attributes, created_at
+            "#,
+        )
+        .bind(profile.id)
+        .bind(profile.email)
+        .bind(profile.region)
+        .bind(profile.roles)
+        .bind(profile.tools_used)
+        .bind(DbJson(profile.attributes))
+        .bind(profile.created_at)
+        .fetch_one(&db)
+        .await
+        .map_err(|err| ApiError::database(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+
         Ok((StatusCode::CREATED, Json(inserted)))
     }
     .await;
@@ -430,7 +459,7 @@ async fn run_proxy(
             amount_cents: price,
             accepted_header: PAYMENT_SIGNATURE_HEADER.to_string(),
             message: "no eligible sponsor campaign found".to_string(),
-            next_step: "either complete a sponsored campaign task or pay directly via /payments/mock/direct"
+            next_step: "either complete a sponsored campaign task or pay directly via /payments/testnet/direct"
                 .to_string(),
         })),
     )
@@ -447,25 +476,19 @@ async fn create_sponsored_api(
     };
 
     let result: ApiResult<(StatusCode, Json<SponsoredApi>)> = async {
-        let (supabase, config) = {
+        let (db, config) = {
             let state = state.inner.read().await;
-            (state.supabase.clone(), state.config.clone())
+            (state.db.clone(), state.config.clone())
         };
 
-        let supabase = supabase.ok_or_else(|| {
-            ApiError::config(
-                "Supabase not configured; set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY",
-            )
-        })?;
+        let db = db.ok_or_else(|| ApiError::config("Postgres not configured; set DATABASE_URL"))?;
 
         if payload.name.trim().is_empty() {
             return Err(ApiError::validation("name is required"));
         }
-
         if payload.sponsor.trim().is_empty() {
             return Err(ApiError::validation("sponsor is required"));
         }
-
         if payload.budget_cents == 0 {
             return Err(ApiError::validation("budget_cents must be greater than 0"));
         }
@@ -476,7 +499,6 @@ async fn create_sponsored_api(
         }
 
         let upstream_method = normalize_upstream_method(payload.upstream_method)?;
-
         reqwest::Url::parse(payload.upstream_url.trim())
             .map_err(|_| ApiError::validation("upstream_url must be a valid URL"))?;
 
@@ -520,7 +542,37 @@ async fn create_sponsored_api(
             created_at: Utc::now(),
         };
 
-        let inserted = supabase.insert_one("sponsored_apis", &api).await?;
+        let inserted_row = sqlx::query_as::<_, SponsoredApiRow>(
+            r#"
+            insert into sponsored_apis (
+                id, name, sponsor, description, upstream_url, upstream_method,
+                upstream_headers, price_cents, budget_total_cents, budget_remaining_cents,
+                active, service_key, created_at
+            ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+            returning id, name, sponsor, description, upstream_url, upstream_method,
+                upstream_headers, price_cents, budget_total_cents, budget_remaining_cents,
+                active, service_key, created_at
+            "#,
+        )
+        .bind(api.id)
+        .bind(api.name)
+        .bind(api.sponsor)
+        .bind(api.description)
+        .bind(api.upstream_url)
+        .bind(api.upstream_method)
+        .bind(DbJson(api.upstream_headers))
+        .bind(api.price_cents as i64)
+        .bind(api.budget_total_cents as i64)
+        .bind(api.budget_remaining_cents as i64)
+        .bind(api.active)
+        .bind(api.service_key)
+        .bind(api.created_at)
+        .fetch_one(&db)
+        .await
+        .map_err(|err| ApiError::database(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+
+        let inserted = SponsoredApi::try_from(inserted_row)
+            .map_err(|err| ApiError::database(StatusCode::INTERNAL_SERVER_ERROR, err))?;
         Ok((StatusCode::CREATED, Json(inserted)))
     }
     .await;
@@ -535,19 +587,31 @@ async fn list_sponsored_apis(State(state): State<SharedState>) -> Response {
     };
 
     let result: ApiResult<(StatusCode, Json<Vec<SponsoredApi>>)> = async {
-        let supabase = {
+        let db = {
             let state = state.inner.read().await;
-            state.supabase.clone()
+            state.db.clone()
         }
-        .ok_or_else(|| {
-            ApiError::config(
-                "Supabase not configured; set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY",
-            )
-        })?;
+        .ok_or_else(|| ApiError::config("Postgres not configured; set DATABASE_URL"))?;
 
-        let apis = supabase
-            .select_many::<SponsoredApi>("sponsored_apis", None)
-            .await?;
+        let api_rows = sqlx::query_as::<_, SponsoredApiRow>(
+            r#"
+            select id, name, sponsor, description, upstream_url, upstream_method,
+                upstream_headers, price_cents, budget_total_cents, budget_remaining_cents,
+                active, service_key, created_at
+            from sponsored_apis
+            order by created_at desc
+            "#,
+        )
+        .fetch_all(&db)
+        .await
+        .map_err(|err| ApiError::database(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+
+        let apis: Vec<SponsoredApi> = api_rows
+            .into_iter()
+            .map(SponsoredApi::try_from)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|err| ApiError::database(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+
         Ok((StatusCode::OK, Json(apis)))
     }
     .await;
@@ -562,20 +626,30 @@ async fn get_sponsored_api(State(state): State<SharedState>, Path(api_id): Path<
     };
 
     let result: ApiResult<(StatusCode, Json<SponsoredApi>)> = async {
-        let supabase = {
+        let db = {
             let state = state.inner.read().await;
-            state.supabase.clone()
+            state.db.clone()
         }
-        .ok_or_else(|| {
-            ApiError::config(
-                "Supabase not configured; set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY",
-            )
-        })?;
+        .ok_or_else(|| ApiError::config("Postgres not configured; set DATABASE_URL"))?;
 
-        let api = supabase
-            .select_one::<SponsoredApi>("sponsored_apis", &format!("id=eq.{api_id}"))
-            .await?
-            .ok_or_else(|| ApiError::not_found("sponsored api not found"))?;
+        let api = sqlx::query_as::<_, SponsoredApiRow>(
+            r#"
+            select id, name, sponsor, description, upstream_url, upstream_method,
+                upstream_headers, price_cents, budget_total_cents, budget_remaining_cents,
+                active, service_key, created_at
+            from sponsored_apis
+            where id = $1
+            "#,
+        )
+        .bind(api_id)
+        .fetch_optional(&db)
+        .await
+        .map_err(|err| ApiError::database(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+        .ok_or_else(|| ApiError::not_found("sponsored api not found"))
+        .and_then(|row| {
+            SponsoredApi::try_from(row)
+                .map_err(|err| ApiError::database(StatusCode::INTERNAL_SERVER_ERROR, err))
+        })?;
 
         Ok((StatusCode::OK, Json(api)))
     }
@@ -596,19 +670,31 @@ async fn run_sponsored_api(
     };
 
     let result: ApiResult<Response> = async {
-        let (supabase, http, config) = {
+        let (db, http, config) = {
             let state = state.inner.read().await;
-            (state.supabase.clone(), state.http.clone(), state.config.clone())
+            (state.db.clone(), state.http.clone(), state.config.clone())
         };
 
-        let supabase = supabase.ok_or_else(|| {
-            ApiError::config("Supabase not configured; set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY")
-        })?;
+        let db = db.ok_or_else(|| ApiError::config("Postgres not configured; set DATABASE_URL"))?;
 
-        let api = supabase
-            .select_one::<SponsoredApi>("sponsored_apis", &format!("id=eq.{api_id}"))
-            .await?
-            .ok_or_else(|| ApiError::not_found("sponsored api not found"))?;
+        let api = sqlx::query_as::<_, SponsoredApiRow>(
+            r#"
+            select id, name, sponsor, description, upstream_url, upstream_method,
+                upstream_headers, price_cents, budget_total_cents, budget_remaining_cents,
+                active, service_key, created_at
+            from sponsored_apis
+            where id = $1
+            "#,
+        )
+        .bind(api_id)
+        .fetch_optional(&db)
+        .await
+        .map_err(|err| ApiError::database(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?
+        .ok_or_else(|| ApiError::not_found("sponsored api not found"))
+        .and_then(|row| {
+            SponsoredApi::try_from(row)
+                .map_err(|err| ApiError::database(StatusCode::INTERNAL_SERVER_ERROR, err))
+        })?;
 
         let price = api.price_cents;
         let service_key = api.service_key.clone();
@@ -629,13 +715,20 @@ async fn run_sponsored_api(
         } else if api.active && api.budget_remaining_cents >= price {
             let new_remaining = api.budget_remaining_cents.saturating_sub(price);
             let still_active = new_remaining >= price && new_remaining > 0;
-            let updates = json!({
-                "budget_remaining_cents": new_remaining,
-                "active": still_active,
-            });
-            let _updated = supabase
-                .update_one::<SponsoredApi>("sponsored_apis", &format!("id=eq.{}", api.id), &updates)
-                .await?;
+
+            sqlx::query(
+                r#"
+                update sponsored_apis
+                set budget_remaining_cents = $1, active = $2
+                where id = $3
+                "#,
+            )
+            .bind(new_remaining as i64)
+            .bind(still_active)
+            .bind(api.id)
+            .execute(&db)
+            .await
+            .map_err(|err| ApiError::database(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
 
             metrics
                 .payment_events_total
@@ -649,13 +742,12 @@ async fn run_sponsored_api(
                 amount_cents: price,
                 accepted_header: PAYMENT_SIGNATURE_HEADER.to_string(),
                 message: "sponsored budget exhausted".to_string(),
-                next_step: "create a payment proof via /payments/mock/direct using the service_key, then retry with payment-signature header"
+                next_step: "create a payment proof via /payments/testnet/direct using the service_key, then retry with payment-signature header"
                     .to_string(),
             }));
         }
 
         let SponsoredApiRunRequest { caller, input } = payload;
-
         let (upstream_status, upstream_body) =
             call_upstream(&http, &api, input, config.sponsored_api_timeout_secs).await?;
 
@@ -668,9 +760,24 @@ async fn run_sponsored_api(
             caller,
             created_at: Utc::now(),
         };
-        supabase
-            .insert_void("sponsored_api_calls", &call_log)
-            .await?;
+
+        sqlx::query(
+            r#"
+            insert into sponsored_api_calls (
+                id, sponsored_api_id, payment_mode, amount_cents, tx_hash, caller, created_at
+            ) values ($1, $2, $3, $4, $5, $6, $7)
+            "#,
+        )
+        .bind(call_log.id)
+        .bind(call_log.sponsored_api_id)
+        .bind(call_log.payment_mode)
+        .bind(call_log.amount_cents as i64)
+        .bind(call_log.tx_hash)
+        .bind(call_log.caller)
+        .bind(call_log.created_at)
+        .execute(&db)
+        .await
+        .map_err(|err| ApiError::database(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
 
         let response_payload = SponsoredApiRunResponse {
             api_id: api.id,
@@ -693,15 +800,75 @@ async fn run_sponsored_api(
     respond(&metrics, "/sponsored-apis/:api_id/run", result)
 }
 
-async fn mock_direct_payment(
+async fn testnet_direct_payment(
     State(state): State<SharedState>,
-    Json(payload): Json<CreateDirectPaymentRequest>,
+    Json(payload): Json<CreateTestnetPaymentRequest>,
 ) -> Response {
     let mut state = state.inner.write().await;
 
     let price = state.service_price(&payload.service);
     let amount = payload.amount_cents.unwrap_or(price);
-    let tx_hash = format!("user-{}", Uuid::new_v4());
+    let tx_hash = payload.tx_hash.trim().to_string();
+    if tx_hash.is_empty() {
+        return respond(
+            &state.metrics,
+            "/payments/testnet/direct",
+            Err::<Response, ApiError>(ApiError::validation("tx_hash is required")),
+        );
+    }
+
+    let rpc_url = match &state.config.testnet_rpc_url {
+        Some(url) if !url.trim().is_empty() => url.clone(),
+        _ => {
+            return respond(
+                &state.metrics,
+                "/payments/testnet/direct",
+                Err::<Response, ApiError>(ApiError::config(
+                    "TESTNET_RPC_URL is required for testnet verification",
+                )),
+            );
+        }
+    };
+
+    let min_confirmations = payload
+        .min_confirmations
+        .unwrap_or(state.config.testnet_min_confirmations)
+        .max(1);
+
+    let tx_block_number = match fetch_tx_block_number(&state.http, &rpc_url, &tx_hash).await {
+        Ok(block) => block,
+        Err(err) => {
+            return respond(
+                &state.metrics,
+                "/payments/testnet/direct",
+                Err::<Response, ApiError>(err),
+            );
+        }
+    };
+
+    let latest_block_number = match fetch_latest_block_number(&state.http, &rpc_url).await {
+        Ok(block) => block,
+        Err(err) => {
+            return respond(
+                &state.metrics,
+                "/payments/testnet/direct",
+                Err::<Response, ApiError>(err),
+            );
+        }
+    };
+
+    let confirmations = latest_block_number
+        .saturating_sub(tx_block_number)
+        .saturating_add(1);
+    if confirmations < min_confirmations {
+        return respond(
+            &state.metrics,
+            "/payments/testnet/direct",
+            Err::<Response, ApiError>(ApiError::validation(format!(
+                "insufficient confirmations: {confirmations} < {min_confirmations}"
+            ))),
+        );
+    }
 
     let proof = PaymentProof {
         tx_hash: tx_hash.clone(),
@@ -735,12 +902,13 @@ async fn mock_direct_payment(
     let signature = encode_payment_proof(&proof);
     respond(
         &state.metrics,
-        "/payments/mock/direct",
+        "/payments/testnet/direct",
         Ok((
             StatusCode::CREATED,
-            Json(DirectPaymentResponse {
+            Json(TestnetPaymentResponse {
                 tx_hash,
                 payment_signature: signature,
+                confirmations,
             }),
         )),
     )
@@ -975,3 +1143,6 @@ async fn prometheus_metrics(State(state): State<SharedState>) -> Response {
     )
         .into_response()
 }
+
+#[cfg(test)]
+mod test;
