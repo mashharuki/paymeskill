@@ -1,93 +1,134 @@
 use axum::http::StatusCode;
+use base64::{Engine as _, engine::general_purpose::STANDARD};
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::error::{ApiError, ApiResult};
+use crate::types::{AppConfig, X402PaymentRequirement, X402SettleResponse, X402VerifyResponse};
 
-pub async fn fetch_tx_block_number(
+#[derive(Debug, Clone)]
+pub struct VerifiedX402Payment {
+    pub tx_hash: Option<String>,
+    pub payment_response_header: String,
+}
+
+pub async fn verify_and_settle_x402_payment(
     http: &reqwest::Client,
-    rpc_url: &str,
-    tx_hash: &str,
-) -> ApiResult<u64> {
-    let payload = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "eth_getTransactionReceipt",
-        "params": [tx_hash]
-    });
-    let response = rpc_call(http, rpc_url, payload).await?;
-    let Some(receipt) = response.get("result").and_then(|value| value.as_object()) else {
+    config: &AppConfig,
+    payment_signature: &str,
+    requirement: &X402PaymentRequirement,
+) -> ApiResult<VerifiedX402Payment> {
+    let payment_payload = decode_payment_signature(payment_signature)?;
+
+    let verify_response: X402VerifyResponse = post_to_facilitator(
+        http,
+        config,
+        &config.x402_verify_path,
+        &payment_payload,
+        requirement,
+    )
+    .await?;
+
+    if !verify_response.is_valid {
         return Err(ApiError::validation(
-            "transaction receipt not found or not yet indexed on testnet",
-        ));
-    };
-    let status_hex = receipt
-        .get("status")
-        .and_then(|value| value.as_str())
-        .unwrap_or("0x0");
-    let status = parse_hex_u64(status_hex)
-        .ok_or_else(|| ApiError::validation("invalid status in transaction receipt"))?;
-    if status != 1 {
-        return Err(ApiError::validation(
-            "transaction status is not successful on testnet",
+            verify_response
+                .invalid_reason
+                .unwrap_or_else(|| "facilitator rejected payment signature".to_string()),
         ));
     }
-    let block_hex = receipt
-        .get("blockNumber")
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| ApiError::validation("missing blockNumber in transaction receipt"))?;
-    parse_hex_u64(block_hex)
-        .ok_or_else(|| ApiError::validation("invalid blockNumber in transaction receipt"))
+
+    let settle_response: X402SettleResponse = post_to_facilitator(
+        http,
+        config,
+        &config.x402_settle_path,
+        &payment_payload,
+        requirement,
+    )
+    .await?;
+
+    if !settle_response.success {
+        return Err(ApiError::validation(
+            settle_response
+                .error_reason
+                .unwrap_or_else(|| "facilitator could not settle payment".to_string()),
+        ));
+    }
+
+    let payment_response_header =
+        STANDARD
+            .encode(serde_json::to_vec(&settle_response).map_err(|err| {
+                ApiError::internal(format!("failed to encode settlement: {err}"))
+            })?);
+
+    Ok(VerifiedX402Payment {
+        tx_hash: settle_response.transaction,
+        payment_response_header,
+    })
 }
 
-pub async fn fetch_latest_block_number(http: &reqwest::Client, rpc_url: &str) -> ApiResult<u64> {
-    let payload = serde_json::json!({
-        "jsonrpc": "2.0",
-        "id": 2,
-        "method": "eth_blockNumber",
-        "params": []
+fn decode_payment_signature(payment_signature: &str) -> ApiResult<Value> {
+    let decoded = STANDARD
+        .decode(payment_signature)
+        .map_err(|err| ApiError::validation(format!("PAYMENT-SIGNATURE must be base64: {err}")))?;
+
+    serde_json::from_slice::<Value>(&decoded).map_err(|err| {
+        ApiError::validation(format!(
+            "PAYMENT-SIGNATURE payload must decode to JSON: {err}"
+        ))
+    })
+}
+
+async fn post_to_facilitator<T: DeserializeOwned>(
+    http: &reqwest::Client,
+    config: &AppConfig,
+    path: &str,
+    payment_payload: &Value,
+    requirement: &X402PaymentRequirement,
+) -> ApiResult<T> {
+    let body = serde_json::json!({
+        "x402Version": 2,
+        "paymentPayload": payment_payload,
+        "paymentRequirements": requirement
     });
-    let response = rpc_call(http, rpc_url, payload).await?;
-    let block_hex = response
-        .get("result")
-        .and_then(|value| value.as_str())
-        .ok_or_else(|| ApiError::validation("missing result for eth_blockNumber"))?;
-    parse_hex_u64(block_hex).ok_or_else(|| ApiError::validation("invalid eth_blockNumber result"))
-}
 
-async fn rpc_call(http: &reqwest::Client, rpc_url: &str, payload: Value) -> ApiResult<Value> {
-    let response = http
-        .post(rpc_url)
-        .json(&payload)
+    let url = join_url(&config.x402_facilitator_url, path);
+    let mut request = http.post(&url).json(&body);
+    if let Some(token) = config.x402_facilitator_bearer_token.as_deref() {
+        request = request.bearer_auth(token);
+    }
+
+    let response = request
         .send()
         .await
         .map_err(|err| ApiError::upstream(StatusCode::BAD_GATEWAY, err.to_string()))?;
 
     let status = response.status();
-    let body = response
+    let raw = response
         .text()
         .await
         .map_err(|err| ApiError::upstream(StatusCode::BAD_GATEWAY, err.to_string()))?;
+
     if !status.is_success() {
-        return Err(ApiError::upstream(
-            StatusCode::BAD_GATEWAY,
-            format!("rpc error status={status} body={body}"),
-        ));
+        let message = format!("facilitator call {url} failed with status={status}: {raw}");
+        if status.is_client_error() {
+            return Err(ApiError::validation(message));
+        }
+        return Err(ApiError::upstream(StatusCode::BAD_GATEWAY, message));
     }
 
-    let value: Value = serde_json::from_str(&body)
-        .map_err(|err| ApiError::upstream(StatusCode::BAD_GATEWAY, err.to_string()))?;
-
-    if value.get("error").is_some() {
-        return Err(ApiError::upstream(
+    serde_json::from_str::<T>(&raw).map_err(|err| {
+        ApiError::upstream(
             StatusCode::BAD_GATEWAY,
-            format!("rpc returned error: {}", value["error"]),
-        ));
-    }
-
-    Ok(value)
+            format!("invalid facilitator JSON response: {err}; raw={raw}"),
+        )
+    })
 }
 
-fn parse_hex_u64(value: &str) -> Option<u64> {
-    let trimmed = value.trim_start_matches("0x");
-    u64::from_str_radix(trimmed, 16).ok()
+fn join_url(base: &str, path: &str) -> String {
+    let trimmed_base = base.trim_end_matches('/');
+    if path.starts_with('/') {
+        format!("{trimmed_base}{path}")
+    } else {
+        format!("{trimmed_base}/{path}")
+    }
 }

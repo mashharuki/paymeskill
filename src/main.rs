@@ -19,7 +19,6 @@ use tracing::info;
 use uuid::Uuid;
 
 use crate::error::{ApiError, ApiResult};
-use crate::onchain::{fetch_latest_block_number, fetch_tx_block_number};
 use crate::types::*;
 use crate::utils::*;
 
@@ -38,7 +37,6 @@ fn build_app(state: SharedState) -> Router {
         )
         .route("/sponsored-apis/:api_id", get(get_sponsored_api))
         .route("/sponsored-apis/:api_id/run", post(run_sponsored_api))
-        .route("/payments/testnet/direct", post(testnet_direct_payment))
         .route(
             "/webhooks/x402scan/settlement",
             post(ingest_x402scan_settlement),
@@ -283,31 +281,46 @@ async fn run_tool(
     headers: HeaderMap,
     Json(payload): Json<ServiceRunRequest>,
 ) -> Response {
-    let state = state.inner.read().await;
-    let price = state.service_price(&service);
+    let (price, metrics, http, config) = {
+        let state = state.inner.read().await;
+        (
+            state.service_price(&service),
+            state.metrics.clone(),
+            state.http.clone(),
+            state.config.clone(),
+        )
+    };
 
-    let result: ApiResult<Response> = match verify_payment_proof(&state, &service, price, &headers)
+    let resource_path = format!("/tool/{service}/run");
+    let result: ApiResult<Response> = match verify_x402_payment(
+        &http,
+        &config,
+        &service,
+        price,
+        &resource_path,
+        &headers,
+    )
+    .await
     {
-        Ok(proof) => {
-            state
-                .metrics
+        Ok(payment) => {
+            metrics
                 .payment_events_total
-                .with_label_values(&[payment_mode_from_proof(&proof), "settled"])
+                .with_label_values(&["user_direct", "settled"])
                 .inc();
 
             Ok(build_paid_tool_response(
                 service,
                 payload,
-                &proof,
-                proof
-                    .sponsored_campaign_id
-                    .and_then(|id| state.campaigns.get(&id).map(|c| c.sponsor.clone())),
+                "user_direct".to_string(),
+                None,
+                payment.tx_hash,
+                Some(payment.payment_response_header.as_str()),
             ))
         }
         Err(err) => Err(err),
     };
 
-    respond(&state.metrics, "/tool/:service/run", result)
+    respond(&metrics, "/tool/:service/run", result)
 }
 
 async fn run_proxy(
@@ -316,6 +329,56 @@ async fn run_proxy(
     headers: HeaderMap,
     Json(payload): Json<ServiceRunRequest>,
 ) -> Response {
+    let has_header = headers.contains_key(PAYMENT_SIGNATURE_HEADER);
+
+    if has_header {
+        let (user_exists, price, metrics, http, config) = {
+            let state = state.inner.read().await;
+            (
+                state.users.contains_key(&payload.user_id),
+                state.service_price(&service),
+                state.metrics.clone(),
+                state.http.clone(),
+                state.config.clone(),
+            )
+        };
+
+        if !user_exists {
+            return respond(
+                &metrics,
+                "/proxy/:service/run",
+                Err::<Response, ApiError>(ApiError::not_found(
+                    "user profile is required before proxy usage",
+                )),
+            );
+        }
+
+        let resource_path = format!("/proxy/{service}/run");
+        let result =
+            match verify_x402_payment(&http, &config, &service, price, &resource_path, &headers)
+                .await
+            {
+                Ok(payment) => {
+                    metrics
+                        .payment_events_total
+                        .with_label_values(&["user_direct", "settled"])
+                        .inc();
+
+                    Ok(build_paid_tool_response(
+                        service,
+                        payload,
+                        "user_direct".to_string(),
+                        None,
+                        payment.tx_hash,
+                        Some(payment.payment_response_header.as_str()),
+                    ))
+                }
+                Err(err) => Err(err),
+            };
+
+        return respond(&metrics, "/proxy/:service/run", result);
+    }
+
     let mut state = state.inner.write().await;
 
     if !state.users.contains_key(&payload.user_id) {
@@ -329,23 +392,6 @@ async fn run_proxy(
     }
 
     let price = state.service_price(&service);
-    let has_header = headers.contains_key(PAYMENT_SIGNATURE_HEADER);
-
-    if has_header {
-        let result = match verify_payment_proof(&state, &service, price, &headers) {
-            Ok(proof) => {
-                state
-                    .metrics
-                    .payment_events_total
-                    .with_label_values(&[payment_mode_from_proof(&proof), "settled"])
-                    .inc();
-                Ok(build_paid_tool_response(service, payload, &proof, None))
-            }
-            Err(err) => Err(err),
-        };
-
-        return respond(&state.metrics, "/proxy/:service/run", result);
-    }
 
     let user = match state.users.get(&payload.user_id) {
         Some(user) => user,
@@ -398,15 +444,6 @@ async fn run_proxy(
         }
 
         let tx_hash = format!("sponsor-{}", Uuid::new_v4());
-        let proof = PaymentProof {
-            tx_hash: tx_hash.clone(),
-            service: service.clone(),
-            amount_cents: price,
-            payer: campaign.sponsor.clone(),
-            sponsored_campaign_id: Some(campaign.id),
-            created_at: Utc::now(),
-        };
-
         state.payments.insert(
             tx_hash.clone(),
             PaymentRecord {
@@ -434,8 +471,10 @@ async fn run_proxy(
             Ok(build_paid_tool_response(
                 service,
                 payload,
-                &proof,
+                "sponsored".to_string(),
                 Some(campaign.sponsor),
+                Some(tx_hash),
+                None,
             )),
         );
     }
@@ -454,14 +493,14 @@ async fn run_proxy(
     respond(
         &state.metrics,
         "/proxy/:service/run",
-        Err::<Response, ApiError>(ApiError::PaymentRequired(PaymentRequired {
-            service,
-            amount_cents: price,
-            accepted_header: PAYMENT_SIGNATURE_HEADER.to_string(),
-            message: "no eligible sponsor campaign found".to_string(),
-            next_step: "either complete a sponsored campaign task or pay directly via /payments/testnet/direct"
-                .to_string(),
-        })),
+        Err::<Response, ApiError>(payment_required_error(
+            &state.config,
+            &service,
+            price,
+            &format!("/proxy/{service}/run"),
+            "no eligible sponsor campaign found",
+            "either complete a sponsor task or pay with PAYMENT-SIGNATURE",
+        )),
     )
 }
 
@@ -476,9 +515,9 @@ async fn create_sponsored_api(
     };
 
     let result: ApiResult<(StatusCode, Json<SponsoredApi>)> = async {
-        let (db, config) = {
+        let (db, http, config) = {
             let state = state.inner.read().await;
-            (state.db.clone(), state.config.clone())
+            (state.db.clone(), state.http.clone(), state.config.clone())
         };
 
         let db = db.ok_or_else(|| ApiError::config("Postgres not configured; set DATABASE_URL"))?;
@@ -511,17 +550,19 @@ async fn create_sponsored_api(
         }
 
         if config.sponsored_api_create_price_cents > 0 {
-            let state = state.inner.read().await;
-            let proof = verify_payment_proof(
-                &state,
+            let resource_path = "/sponsored-apis".to_string();
+            verify_x402_payment(
+                &http,
+                &config,
                 SPONSORED_API_CREATE_SERVICE,
                 config.sponsored_api_create_price_cents,
+                &resource_path,
                 &headers,
-            )?;
-            state
-                .metrics
+            )
+            .await?;
+            metrics
                 .payment_events_total
-                .with_label_values(&[payment_mode_from_proof(&proof), "settled"])
+                .with_label_values(&["user_direct", "settled"])
                 .inc();
         }
 
@@ -698,20 +739,29 @@ async fn run_sponsored_api(
 
         let price = api.price_cents;
         let service_key = api.service_key.clone();
-        let mut payment_proof: Option<PaymentProof> = None;
         let mut payment_mode = "sponsored".to_string();
         let mut sponsored_by = None;
+        let mut tx_hash: Option<String> = None;
+        let mut payment_response_header: Option<String> = None;
 
         if headers.contains_key(PAYMENT_SIGNATURE_HEADER) {
-            let state = state.inner.read().await;
-            let proof = verify_payment_proof(&state, &service_key, price, &headers)?;
-            state
-                .metrics
+            let resource_path = format!("/sponsored-apis/{api_id}/run");
+            let payment = verify_x402_payment(
+                &http,
+                &config,
+                &service_key,
+                price,
+                &resource_path,
+                &headers,
+            )
+            .await?;
+            metrics
                 .payment_events_total
-                .with_label_values(&[payment_mode_from_proof(&proof), "settled"])
+                .with_label_values(&["user_direct", "settled"])
                 .inc();
-            payment_mode = payment_mode_from_proof(&proof).to_string();
-            payment_proof = Some(proof);
+            payment_mode = "user_direct".to_string();
+            tx_hash = payment.tx_hash;
+            payment_response_header = Some(payment.payment_response_header);
         } else if api.active && api.budget_remaining_cents >= price {
             let new_remaining = api.budget_remaining_cents.saturating_sub(price);
             let still_active = new_remaining >= price && new_remaining > 0;
@@ -728,7 +778,9 @@ async fn run_sponsored_api(
             .bind(api.id)
             .execute(&db)
             .await
-            .map_err(|err| ApiError::database(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+            .map_err(|err| {
+                ApiError::database(StatusCode::INTERNAL_SERVER_ERROR, err.to_string())
+            })?;
 
             metrics
                 .payment_events_total
@@ -737,14 +789,14 @@ async fn run_sponsored_api(
             metrics.sponsor_spend_cents_total.inc_by(price);
             sponsored_by = Some(api.sponsor.clone());
         } else {
-            return Err(ApiError::PaymentRequired(PaymentRequired {
-                service: service_key,
-                amount_cents: price,
-                accepted_header: PAYMENT_SIGNATURE_HEADER.to_string(),
-                message: "sponsored budget exhausted".to_string(),
-                next_step: "create a payment proof via /payments/testnet/direct using the service_key, then retry with payment-signature header"
-                    .to_string(),
-            }));
+            return Err(payment_required_error(
+                &config,
+                &service_key,
+                price,
+                &format!("/sponsored-apis/{api_id}/run"),
+                "sponsored budget exhausted",
+                "pay with PAYMENT-SIGNATURE and retry",
+            ));
         }
 
         let SponsoredApiRunRequest { caller, input } = payload;
@@ -756,7 +808,7 @@ async fn run_sponsored_api(
             sponsored_api_id: api.id,
             payment_mode: payment_mode.clone(),
             amount_cents: price,
-            tx_hash: payment_proof.as_ref().map(|proof| proof.tx_hash.clone()),
+            tx_hash: tx_hash.clone(),
             caller,
             created_at: Utc::now(),
         };
@@ -783,14 +835,23 @@ async fn run_sponsored_api(
             api_id: api.id,
             payment_mode,
             sponsored_by,
-            tx_hash: payment_proof.as_ref().map(|proof| proof.tx_hash.clone()),
+            tx_hash,
             upstream_status,
             upstream_body,
         };
 
         let mut response = (StatusCode::OK, Json(response_payload)).into_response();
-        if let Some(proof) = payment_proof {
-            attach_payment_headers(&mut response, &proof);
+        response.headers_mut().insert(
+            HeaderName::from_static(X402_VERSION_HEADER),
+            HeaderValue::from_static("2"),
+        );
+        if let Some(settlement_header) = payment_response_header {
+            if let Ok(header_value) = HeaderValue::from_str(&settlement_header) {
+                response.headers_mut().insert(
+                    HeaderName::from_static(PAYMENT_RESPONSE_HEADER),
+                    header_value,
+                );
+            }
         }
 
         Ok(response)
@@ -798,120 +859,6 @@ async fn run_sponsored_api(
     .await;
 
     respond(&metrics, "/sponsored-apis/:api_id/run", result)
-}
-
-async fn testnet_direct_payment(
-    State(state): State<SharedState>,
-    Json(payload): Json<CreateTestnetPaymentRequest>,
-) -> Response {
-    let mut state = state.inner.write().await;
-
-    let price = state.service_price(&payload.service);
-    let amount = payload.amount_cents.unwrap_or(price);
-    let tx_hash = payload.tx_hash.trim().to_string();
-    if tx_hash.is_empty() {
-        return respond(
-            &state.metrics,
-            "/payments/testnet/direct",
-            Err::<Response, ApiError>(ApiError::validation("tx_hash is required")),
-        );
-    }
-
-    let rpc_url = match &state.config.testnet_rpc_url {
-        Some(url) if !url.trim().is_empty() => url.clone(),
-        _ => {
-            return respond(
-                &state.metrics,
-                "/payments/testnet/direct",
-                Err::<Response, ApiError>(ApiError::config(
-                    "TESTNET_RPC_URL is required for testnet verification",
-                )),
-            );
-        }
-    };
-
-    let min_confirmations = payload
-        .min_confirmations
-        .unwrap_or(state.config.testnet_min_confirmations)
-        .max(1);
-
-    let tx_block_number = match fetch_tx_block_number(&state.http, &rpc_url, &tx_hash).await {
-        Ok(block) => block,
-        Err(err) => {
-            return respond(
-                &state.metrics,
-                "/payments/testnet/direct",
-                Err::<Response, ApiError>(err),
-            );
-        }
-    };
-
-    let latest_block_number = match fetch_latest_block_number(&state.http, &rpc_url).await {
-        Ok(block) => block,
-        Err(err) => {
-            return respond(
-                &state.metrics,
-                "/payments/testnet/direct",
-                Err::<Response, ApiError>(err),
-            );
-        }
-    };
-
-    let confirmations = latest_block_number
-        .saturating_sub(tx_block_number)
-        .saturating_add(1);
-    if confirmations < min_confirmations {
-        return respond(
-            &state.metrics,
-            "/payments/testnet/direct",
-            Err::<Response, ApiError>(ApiError::validation(format!(
-                "insufficient confirmations: {confirmations} < {min_confirmations}"
-            ))),
-        );
-    }
-
-    let proof = PaymentProof {
-        tx_hash: tx_hash.clone(),
-        service: payload.service.clone(),
-        amount_cents: amount,
-        payer: payload.payer.clone(),
-        sponsored_campaign_id: None,
-        created_at: Utc::now(),
-    };
-
-    state.payments.insert(
-        tx_hash.clone(),
-        PaymentRecord {
-            tx_hash: tx_hash.clone(),
-            campaign_id: None,
-            service: payload.service,
-            amount_cents: amount,
-            payer: payload.payer,
-            source: PaymentSource::User,
-            status: PaymentStatus::Settled,
-            created_at: Utc::now(),
-        },
-    );
-
-    state
-        .metrics
-        .payment_events_total
-        .with_label_values(&["user_direct", "settled"])
-        .inc();
-
-    let signature = encode_payment_proof(&proof);
-    respond(
-        &state.metrics,
-        "/payments/testnet/direct",
-        Ok((
-            StatusCode::CREATED,
-            Json(TestnetPaymentResponse {
-                tx_hash,
-                payment_signature: signature,
-                confirmations,
-            }),
-        )),
-    )
 }
 
 async fn ingest_x402scan_settlement(

@@ -13,8 +13,8 @@ description: Operate sponsored APIs and x402-style campaigns for PayloadExchange
 4. Create sponsor campaigns with target roles, target tools, task gate, and budget.
 5. Record sponsor task completion before allowing proxy-sponsored usage.
 6. Create sponsored APIs via `POST /sponsored-apis`.
-7. If `SPONSORED_API_CREATE_PRICE_CENTS` > 0, pay for creation first using `/payments/testnet/direct` with `service: "sponsored-api-create"` and a testnet `tx_hash`.
-8. Call sponsored APIs via `POST /sponsored-apis/:api_id/run`. Calls are free while `budget_remaining_cents` covers the per-call price; once exhausted, pay with the returned `service_key` and retry with `payment-signature`.
+7. If `SPONSORED_API_CREATE_PRICE_CENTS` > 0, first call `POST /sponsored-apis` without payment, read `PAYMENT-REQUIRED`, then retry with `PAYMENT-SIGNATURE` per x402.
+8. Call sponsored APIs via `POST /sponsored-apis/:api_id/run`. Calls are free while `budget_remaining_cents` covers the per-call price; once exhausted, server returns `402` with `PAYMENT-REQUIRED`, then retry with `PAYMENT-SIGNATURE`.
 9. Use `/proxy/:service/run` for sponsored campaign flows and `/tool/:service/run` for direct paid flows.
 10. Log skill usage outcomes to `/creator/metrics/event`.
 11. Read `/creator/metrics` and `/metrics` for operational monitoring.

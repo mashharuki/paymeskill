@@ -9,6 +9,7 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 pub const PAYMENT_SIGNATURE_HEADER: &str = "payment-signature";
+pub const PAYMENT_REQUIRED_HEADER: &str = "payment-required";
 pub const PAYMENT_RESPONSE_HEADER: &str = "payment-response";
 pub const X402_VERSION_HEADER: &str = "x402-version";
 pub const DEFAULT_PRICE_CENTS: u64 = 5;
@@ -16,14 +17,24 @@ pub const SPONSORED_API_CREATE_SERVICE: &str = "sponsored-api-create";
 pub const SPONSORED_API_SERVICE_PREFIX: &str = "sponsored-api";
 pub const DEFAULT_SPONSORED_API_CREATE_PRICE_CENTS: u64 = 25;
 pub const DEFAULT_SPONSORED_API_TIMEOUT_SECS: u64 = 12;
-pub const DEFAULT_TESTNET_MIN_CONFIRMATIONS: u64 = 1;
+pub const DEFAULT_X402_FACILITATOR_URL: &str = "https://x402.org/facilitator";
+pub const DEFAULT_X402_VERIFY_PATH: &str = "/verify";
+pub const DEFAULT_X402_SETTLE_PATH: &str = "/settle";
+pub const DEFAULT_X402_NETWORK: &str = "base-sepolia";
+pub const DEFAULT_PUBLIC_BASE_URL: &str = "http://localhost:3000";
 
 #[derive(Clone)]
 pub struct AppConfig {
     pub sponsored_api_create_price_cents: u64,
     pub sponsored_api_timeout_secs: u64,
-    pub testnet_rpc_url: Option<String>,
-    pub testnet_min_confirmations: u64,
+    pub x402_facilitator_url: String,
+    pub x402_verify_path: String,
+    pub x402_settle_path: String,
+    pub x402_facilitator_bearer_token: Option<String>,
+    pub x402_network: String,
+    pub x402_pay_to: Option<String>,
+    pub x402_asset: Option<String>,
+    pub public_base_url: String,
 }
 
 impl AppConfig {
@@ -37,11 +48,19 @@ impl AppConfig {
                 "SPONSORED_API_TIMEOUT_SECS",
                 DEFAULT_SPONSORED_API_TIMEOUT_SECS,
             ),
-            testnet_rpc_url: std::env::var("TESTNET_RPC_URL").ok(),
-            testnet_min_confirmations: read_env_u64(
-                "TESTNET_MIN_CONFIRMATIONS",
-                DEFAULT_TESTNET_MIN_CONFIRMATIONS,
-            ),
+            x402_facilitator_url: std::env::var("X402_FACILITATOR_URL")
+                .unwrap_or_else(|_| DEFAULT_X402_FACILITATOR_URL.to_string()),
+            x402_verify_path: std::env::var("X402_VERIFY_PATH")
+                .unwrap_or_else(|_| DEFAULT_X402_VERIFY_PATH.to_string()),
+            x402_settle_path: std::env::var("X402_SETTLE_PATH")
+                .unwrap_or_else(|_| DEFAULT_X402_SETTLE_PATH.to_string()),
+            x402_facilitator_bearer_token: std::env::var("X402_FACILITATOR_BEARER_TOKEN").ok(),
+            x402_network: std::env::var("X402_NETWORK")
+                .unwrap_or_else(|_| DEFAULT_X402_NETWORK.to_string()),
+            x402_pay_to: std::env::var("X402_PAY_TO").ok(),
+            x402_asset: std::env::var("X402_ASSET").ok(),
+            public_base_url: std::env::var("PUBLIC_BASE_URL")
+                .unwrap_or_else(|_| DEFAULT_PUBLIC_BASE_URL.to_string()),
         }
     }
 }
@@ -254,18 +273,9 @@ pub struct PaymentRequired {
     pub service: String,
     pub amount_cents: u64,
     pub accepted_header: String,
+    pub payment_required: String,
     pub message: String,
     pub next_step: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PaymentProof {
-    pub tx_hash: String,
-    pub service: String,
-    pub amount_cents: u64,
-    pub payer: String,
-    pub sponsored_campaign_id: Option<Uuid>,
-    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -294,27 +304,44 @@ pub struct PaymentRecord {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Serialize)]
-pub struct PaymentSettlement {
-    pub tx_hash: String,
-    pub status: PaymentStatus,
-    pub settled_at: DateTime<Utc>,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct X402PaymentRequirement {
+    pub scheme: String,
+    pub network: String,
+    pub max_amount_required: String,
+    pub resource: String,
+    pub description: String,
+    pub mime_type: String,
+    pub pay_to: String,
+    pub max_timeout_seconds: u64,
+    pub asset: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<Value>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub extra: HashMap<String, Value>,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct CreateTestnetPaymentRequest {
-    pub payer: String,
-    pub service: String,
-    pub tx_hash: String,
-    pub amount_cents: Option<u64>,
-    pub min_confirmations: Option<u64>,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct X402VerifyResponse {
+    pub is_valid: bool,
+    #[serde(default)]
+    pub invalid_reason: Option<String>,
+    #[serde(default)]
+    pub payer: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
-pub struct TestnetPaymentResponse {
-    pub tx_hash: String,
-    pub payment_signature: String,
-    pub confirmations: u64,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct X402SettleResponse {
+    pub success: bool,
+    #[serde(default)]
+    pub transaction: Option<String>,
+    #[serde(default)]
+    pub payer: Option<String>,
+    #[serde(default)]
+    pub error_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

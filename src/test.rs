@@ -7,9 +7,13 @@ use tower::ServiceExt;
 fn required_env(key: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| {
         panic!(
-            "missing required env var {key}; set TESTNET_RPC_URL, TESTNET_CONFIRMED_TX_HASH, and TESTNET_FAILED_TX_HASH to run testnet tests"
+            "missing required env var {key}; set TESTNET_PAYMENT_SIGNATURE_DESIGN, X402_PAY_TO, and X402_ASSET for live testnet x402 tests"
         )
     })
+}
+
+fn optional_env(key: &str, default: &str) -> String {
+    std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
 fn test_app() -> (Router, SharedState) {
@@ -19,13 +23,24 @@ fn test_app() -> (Router, SharedState) {
     (build_app(state.clone()), state)
 }
 
-async fn post_json(app: &Router, uri: &str, body: serde_json::Value) -> axum::response::Response {
+async fn post_json(
+    app: &Router,
+    uri: &str,
+    body: serde_json::Value,
+    payment_signature: Option<&str>,
+) -> axum::response::Response {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json");
+
+    if let Some(signature) = payment_signature {
+        builder = builder.header(PAYMENT_SIGNATURE_HEADER, signature);
+    }
+
     app.clone()
         .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(uri)
-                .header(header::CONTENT_TYPE, "application/json")
+            builder
                 .body(Body::from(body.to_string()))
                 .expect("request should build"),
         )
@@ -40,62 +55,36 @@ async fn read_json(response: axum::response::Response) -> serde_json::Value {
     serde_json::from_slice::<serde_json::Value>(&bytes).expect("response should be valid json")
 }
 
-async fn configure_testnet_rpc_from_env(state: &SharedState) {
-    let rpc = required_env("TESTNET_RPC_URL");
+async fn configure_local_x402(state: &SharedState) {
     let mut locked = state.inner.write().await;
-    locked.config.testnet_rpc_url = Some(rpc);
-    locked.config.testnet_min_confirmations = 1;
+    locked.config.x402_facilitator_url = "https://x402.org/facilitator".to_string();
+    locked.config.x402_verify_path = "/verify".to_string();
+    locked.config.x402_settle_path = "/settle".to_string();
+    locked.config.x402_network = "base-sepolia".to_string();
+    locked.config.x402_pay_to = Some("0x1111111111111111111111111111111111111111".to_string());
+    locked.config.x402_asset = Some("0x2222222222222222222222222222222222222222".to_string());
+    locked.config.public_base_url = "http://localhost:3000".to_string();
 }
 
-async fn create_testnet_payment_signature(
-    app: &Router,
-    tx_hash: &str,
-    service: &str,
-) -> (String, axum::response::Response) {
-    let payment_response = post_json(
-        app,
-        "/payments/testnet/direct",
-        serde_json::json!({
-            "payer": "dev@testnet.example",
-            "service": service,
-            "tx_hash": tx_hash
-        }),
-    )
-    .await;
-    assert_eq!(payment_response.status(), StatusCode::CREATED);
-
-    let payment_json = read_json(payment_response).await;
-    let signature = payment_json["payment_signature"]
-        .as_str()
-        .expect("signature should exist")
-        .to_string();
-
-    let run_response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri(format!("/tool/{service}/run"))
-                .header(header::CONTENT_TYPE, "application/json")
-                .header(PAYMENT_SIGNATURE_HEADER, signature.clone())
-                .body(Body::from(
-                    serde_json::json!({
-                        "user_id": Uuid::new_v4(),
-                        "input": "testnet paid run"
-                    })
-                    .to_string(),
-                ))
-                .expect("request should build"),
-        )
-        .await
-        .expect("router should handle request");
-
-    (signature, run_response)
+async fn configure_live_x402_from_env(state: &SharedState) {
+    let mut locked = state.inner.write().await;
+    locked.config.x402_facilitator_url =
+        optional_env("X402_FACILITATOR_URL", "https://x402.org/facilitator");
+    locked.config.x402_verify_path = optional_env("X402_VERIFY_PATH", "/verify");
+    locked.config.x402_settle_path = optional_env("X402_SETTLE_PATH", "/settle");
+    locked.config.x402_network = optional_env("X402_NETWORK", "base-sepolia");
+    locked.config.x402_pay_to = Some(required_env("X402_PAY_TO"));
+    locked.config.x402_asset = Some(required_env("X402_ASSET"));
+    locked.config.public_base_url = optional_env("PUBLIC_BASE_URL", "http://localhost:3000");
+    locked.config.x402_facilitator_bearer_token =
+        std::env::var("X402_FACILITATOR_BEARER_TOKEN").ok();
 }
 
 #[tokio::test]
-async fn tool_requires_x402_payment_proof() {
-    let (app, _state) = test_app();
+async fn testnet_tool_requires_payment_signature_challenge() {
+    let (app, state) = test_app();
+    configure_local_x402(&state).await;
+
     let response = post_json(
         &app,
         "/tool/design/run",
@@ -103,94 +92,86 @@ async fn tool_requires_x402_payment_proof() {
             "user_id": Uuid::new_v4(),
             "input": "test payload"
         }),
+        None,
     )
     .await;
 
     assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
-    assert_eq!(
-        response
-            .headers()
-            .get(X402_VERSION_HEADER)
-            .and_then(|v| v.to_str().ok()),
-        Some("2")
-    );
+    assert!(response.headers().contains_key(PAYMENT_REQUIRED_HEADER));
+    assert!(response.headers().contains_key(X402_VERSION_HEADER));
 
     let json = read_json(response).await;
-    assert_eq!(json["accepted_header"], "payment-signature");
+    assert_eq!(json["accepted_header"], PAYMENT_SIGNATURE_HEADER);
     assert_eq!(json["service"], "design");
+}
+
+#[tokio::test]
+async fn testnet_invalid_payment_signature_rejected() {
+    let (app, state) = test_app();
+    configure_local_x402(&state).await;
+
+    let response = post_json(
+        &app,
+        "/tool/design/run",
+        serde_json::json!({
+            "user_id": Uuid::new_v4(),
+            "input": "test payload"
+        }),
+        Some("not-base64"),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
+    assert!(response.headers().contains_key(PAYMENT_REQUIRED_HEADER));
+    let json = read_json(response).await;
+    assert!(
+        json["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("payment rejected")
+    );
 }
 
 #[tokio::test]
 async fn testnet_payment_signature_unlocks_tool() {
     let (app, state) = test_app();
-    configure_testnet_rpc_from_env(&state).await;
-    let confirmed_tx = required_env("TESTNET_CONFIRMED_TX_HASH");
-
-    let (_sig, run_response) =
-        create_testnet_payment_signature(&app, &confirmed_tx, "design").await;
-
-    assert_eq!(run_response.status(), StatusCode::OK);
-    assert!(run_response.headers().contains_key(PAYMENT_RESPONSE_HEADER));
-    let body = read_json(run_response).await;
-    assert_eq!(body["payment_mode"], "user_direct");
-    assert_eq!(body["service"], "design");
-}
-
-#[tokio::test]
-async fn testnet_payment_requires_confirmations() {
-    let (app, state) = test_app();
-    configure_testnet_rpc_from_env(&state).await;
-    let confirmed_tx = required_env("TESTNET_CONFIRMED_TX_HASH");
+    configure_live_x402_from_env(&state).await;
+    let signature = required_env("TESTNET_PAYMENT_SIGNATURE_DESIGN");
 
     let response = post_json(
         &app,
-        "/payments/testnet/direct",
+        "/tool/design/run",
         serde_json::json!({
-            "payer": "dev@testnet.example",
-            "service": "design",
-            "tx_hash": confirmed_tx,
-            "min_confirmations": u64::MAX
+            "user_id": Uuid::new_v4(),
+            "input": "testnet paid run"
         }),
+        Some(signature.as_str()),
     )
     .await;
 
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers().contains_key(PAYMENT_RESPONSE_HEADER));
     let json = read_json(response).await;
-    assert!(
-        json["error"]["message"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("insufficient confirmations")
-    );
+    assert_eq!(json["payment_mode"], "user_direct");
+    assert_eq!(json["service"], "design");
 }
 
 #[tokio::test]
-async fn testnet_payment_proof_service_mismatch_is_rejected() {
+async fn testnet_payment_signature_service_mismatch_is_rejected() {
     let (app, state) = test_app();
-    configure_testnet_rpc_from_env(&state).await;
-    let confirmed_tx = required_env("TESTNET_CONFIRMED_TX_HASH");
+    configure_live_x402_from_env(&state).await;
+    let signature = required_env("TESTNET_PAYMENT_SIGNATURE_DESIGN");
 
-    let (signature, _ok) = create_testnet_payment_signature(&app, &confirmed_tx, "design").await;
-
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method("POST")
-                .uri("/tool/storage/run")
-                .header(header::CONTENT_TYPE, "application/json")
-                .header(PAYMENT_SIGNATURE_HEADER, signature)
-                .body(Body::from(
-                    serde_json::json!({
-                        "user_id": Uuid::new_v4(),
-                        "input": "store object"
-                    })
-                    .to_string(),
-                ))
-                .expect("request should build"),
-        )
-        .await
-        .expect("router should handle request");
+    let response = post_json(
+        &app,
+        "/tool/storage/run",
+        serde_json::json!({
+            "user_id": Uuid::new_v4(),
+            "input": "testnet paid run"
+        }),
+        Some(signature.as_str()),
+    )
+    .await;
 
     assert_eq!(response.status(), StatusCode::PAYMENT_REQUIRED);
     let json = read_json(response).await;
@@ -198,33 +179,6 @@ async fn testnet_payment_proof_service_mismatch_is_rejected() {
         json["message"]
             .as_str()
             .unwrap_or_default()
-            .contains("service mismatch")
-    );
-}
-
-#[tokio::test]
-async fn testnet_failed_transaction_is_rejected() {
-    let (app, state) = test_app();
-    configure_testnet_rpc_from_env(&state).await;
-    let failed_tx = required_env("TESTNET_FAILED_TX_HASH");
-
-    let response = post_json(
-        &app,
-        "/payments/testnet/direct",
-        serde_json::json!({
-            "payer": "dev@testnet.example",
-            "service": "design",
-            "tx_hash": failed_tx
-        }),
-    )
-    .await;
-
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    let json = read_json(response).await;
-    assert!(
-        json["error"]["message"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("not successful")
+            .contains("payment rejected")
     );
 }

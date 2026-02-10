@@ -4,18 +4,20 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use chrono::Utc;
 use reqwest::{Client, Method};
 use serde_json::Value;
-use std::time::Duration;
+use std::{collections::HashMap, time::Duration};
 use uuid::Uuid;
 
 use crate::error::{ApiError, ApiResult};
+use crate::onchain::{VerifiedX402Payment, verify_and_settle_x402_payment};
 use crate::types::{
-    AppState, Campaign, Metrics, PAYMENT_RESPONSE_HEADER, PAYMENT_SIGNATURE_HEADER, PaymentProof,
-    PaymentRequired, PaymentSettlement, PaymentStatus, SPONSORED_API_SERVICE_PREFIX,
-    ServiceRunRequest, ServiceRunResponse, SponsoredApi, UserProfile, X402_VERSION_HEADER,
+    AppConfig, AppState, Campaign, Metrics, PAYMENT_RESPONSE_HEADER, PAYMENT_SIGNATURE_HEADER,
+    PaymentRequired, SPONSORED_API_SERVICE_PREFIX, ServiceRunRequest, ServiceRunResponse,
+    SponsoredApi, UserProfile, X402_VERSION_HEADER, X402PaymentRequirement,
 };
+
+const USDC_BASE_UNITS_PER_CENT: u128 = 10_000;
 
 pub fn respond<T: IntoResponse>(
     metrics: &Metrics,
@@ -64,90 +66,132 @@ pub fn has_completed_task(
     })
 }
 
-pub fn verify_payment_proof(
-    state: &AppState,
+pub async fn verify_x402_payment(
+    http: &Client,
+    config: &AppConfig,
     service: &str,
-    price: u64,
+    amount_cents: u64,
+    resource_path: &str,
     headers: &HeaderMap,
-) -> ApiResult<PaymentProof> {
+) -> ApiResult<VerifiedX402Payment> {
     let Some(signature) = headers
         .get(PAYMENT_SIGNATURE_HEADER)
         .and_then(|value| value.to_str().ok())
     else {
-        return Err(ApiError::PaymentRequired(PaymentRequired {
-            service: service.to_string(),
-            amount_cents: price,
-            accepted_header: PAYMENT_SIGNATURE_HEADER.to_string(),
-            message: "missing payment proof".to_string(),
-            next_step:
-                "call /payments/testnet/direct first, then retry with payment-signature header"
-                    .to_string(),
-        }));
+        return Err(payment_required_error(
+            config,
+            service,
+            amount_cents,
+            resource_path,
+            "missing PAYMENT-SIGNATURE header",
+            "create a payment from the PAYMENT-REQUIRED challenge and retry",
+        ));
     };
 
-    let proof = decode_payment_proof(signature).map_err(|err| {
-        ApiError::PaymentRequired(PaymentRequired {
-            service: service.to_string(),
-            amount_cents: price,
-            accepted_header: PAYMENT_SIGNATURE_HEADER.to_string(),
-            message: format!("invalid payment proof: {err}"),
-            next_step: "regenerate payment signature via /payments/testnet/direct".to_string(),
-        })
-    })?;
-
-    if proof.service != service {
-        return Err(ApiError::PaymentRequired(PaymentRequired {
-            service: service.to_string(),
-            amount_cents: price,
-            accepted_header: PAYMENT_SIGNATURE_HEADER.to_string(),
-            message: "payment proof service mismatch".to_string(),
-            next_step: "create a payment proof for this specific service".to_string(),
-        }));
+    let requirement = build_payment_requirement(config, service, amount_cents, resource_path)?;
+    match verify_and_settle_x402_payment(http, config, signature, &requirement).await {
+        Ok(payment) => Ok(payment),
+        Err(err) => match err {
+            ApiError::Config { .. } => Err(err),
+            _ => Err(payment_required_error(
+                config,
+                service,
+                amount_cents,
+                resource_path,
+                format!("payment rejected: {err}"),
+                "regenerate PAYMENT-SIGNATURE from the latest challenge and retry",
+            )),
+        },
     }
+}
 
-    if proof.amount_cents < price {
-        return Err(ApiError::PaymentRequired(PaymentRequired {
-            service: service.to_string(),
-            amount_cents: price,
-            accepted_header: PAYMENT_SIGNATURE_HEADER.to_string(),
-            message: format!(
-                "insufficient amount in proof: {} < {}",
-                proof.amount_cents, price
-            ),
-            next_step: "create a payment proof with an amount >= service price".to_string(),
-        }));
-    }
+pub fn payment_required_error(
+    config: &AppConfig,
+    service: &str,
+    amount_cents: u64,
+    resource_path: &str,
+    message: impl Into<String>,
+    next_step: impl Into<String>,
+) -> ApiError {
+    let requirement = match build_payment_requirement(config, service, amount_cents, resource_path)
+    {
+        Ok(value) => value,
+        Err(err) => return err,
+    };
 
-    let payment = state.payments.get(&proof.tx_hash);
-    match payment {
-        Some(payment) if payment.status == PaymentStatus::Settled => Ok(proof),
-        Some(_) => Err(ApiError::PaymentRequired(PaymentRequired {
-            service: service.to_string(),
-            amount_cents: price,
-            accepted_header: PAYMENT_SIGNATURE_HEADER.to_string(),
-            message: "payment exists but is not settled".to_string(),
-            next_step: "wait for settlement or ingest a settled webhook from x402scan".to_string(),
-        })),
-        None => Err(ApiError::PaymentRequired(PaymentRequired {
-            service: service.to_string(),
-            amount_cents: price,
-            accepted_header: PAYMENT_SIGNATURE_HEADER.to_string(),
-            message: "payment tx hash not found in ledger".to_string(),
-            next_step:
-                "register payment via /payments/testnet/direct or /webhooks/x402scan/settlement"
-                    .to_string(),
-        })),
+    let payment_required = match encode_payment_required_header(&requirement) {
+        Ok(value) => value,
+        Err(err) => return ApiError::internal(err),
+    };
+
+    ApiError::PaymentRequired(PaymentRequired {
+        service: service.to_string(),
+        amount_cents,
+        accepted_header: PAYMENT_SIGNATURE_HEADER.to_string(),
+        payment_required,
+        message: message.into(),
+        next_step: next_step.into(),
+    })
+}
+
+fn build_payment_requirement(
+    config: &AppConfig,
+    service: &str,
+    amount_cents: u64,
+    resource_path: &str,
+) -> ApiResult<X402PaymentRequirement> {
+    let pay_to = required_non_empty_env_like(config.x402_pay_to.as_deref(), "X402_PAY_TO")?;
+    let asset = required_non_empty_env_like(config.x402_asset.as_deref(), "X402_ASSET")?;
+
+    let resource = format!(
+        "{}{}",
+        config.public_base_url.trim_end_matches('/'),
+        resource_path
+    );
+
+    Ok(X402PaymentRequirement {
+        scheme: "exact".to_string(),
+        network: config.x402_network.clone(),
+        max_amount_required: amount_to_base_units(amount_cents),
+        resource,
+        description: format!("Access paid service '{service}'"),
+        mime_type: "application/json".to_string(),
+        pay_to,
+        max_timeout_seconds: 300,
+        asset,
+        output_schema: None,
+        extra: HashMap::new(),
+    })
+}
+
+fn required_non_empty_env_like(value: Option<&str>, key: &str) -> ApiResult<String> {
+    let Some(raw) = value else {
+        return Err(ApiError::config(format!("{key} is required for x402")));
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(ApiError::config(format!("{key} is required for x402")));
     }
+    Ok(trimmed.to_string())
+}
+
+fn amount_to_base_units(amount_cents: u64) -> String {
+    (u128::from(amount_cents) * USDC_BASE_UNITS_PER_CENT).to_string()
+}
+
+fn encode_payment_required_header(requirement: &X402PaymentRequirement) -> Result<String, String> {
+    let bytes = serde_json::to_vec(&vec![requirement]).map_err(|err| err.to_string())?;
+    Ok(STANDARD.encode(bytes))
 }
 
 pub fn build_paid_tool_response(
     service: String,
     request: ServiceRunRequest,
-    proof: &PaymentProof,
+    payment_mode: String,
     sponsored_by: Option<String>,
+    tx_hash: Option<String>,
+    payment_response_header: Option<&str>,
 ) -> Response {
-    let payment_mode = payment_mode_from_proof(proof).to_string();
-
     let payload = ServiceRunResponse {
         service: service.clone(),
         output: format!(
@@ -156,54 +200,25 @@ pub fn build_paid_tool_response(
         ),
         payment_mode,
         sponsored_by,
-        tx_hash: Some(proof.tx_hash.clone()),
+        tx_hash,
     };
 
     let mut response = (StatusCode::OK, Json(payload)).into_response();
-    attach_payment_headers(&mut response, proof);
-    response
-}
-
-pub fn attach_payment_headers(response: &mut Response, proof: &PaymentProof) {
     response.headers_mut().insert(
         HeaderName::from_static(X402_VERSION_HEADER),
         HeaderValue::from_static("2"),
     );
 
-    let settlement = PaymentSettlement {
-        tx_hash: proof.tx_hash.clone(),
-        status: PaymentStatus::Settled,
-        settled_at: Utc::now(),
-    };
-
-    let settlement_encoded = STANDARD.encode(
-        serde_json::to_vec(&settlement).expect("payment settlement response should serialize"),
-    );
-
-    if let Ok(header_value) = HeaderValue::from_str(&settlement_encoded) {
-        response.headers_mut().insert(
-            HeaderName::from_static(PAYMENT_RESPONSE_HEADER),
-            header_value,
-        );
+    if let Some(payment_response) = payment_response_header {
+        if let Ok(header_value) = HeaderValue::from_str(payment_response) {
+            response.headers_mut().insert(
+                HeaderName::from_static(PAYMENT_RESPONSE_HEADER),
+                header_value,
+            );
+        }
     }
-}
 
-pub fn payment_mode_from_proof(proof: &PaymentProof) -> &'static str {
-    if proof.sponsored_campaign_id.is_some() {
-        "sponsored"
-    } else {
-        "user_direct"
-    }
-}
-
-pub fn encode_payment_proof(proof: &PaymentProof) -> String {
-    let serialized = serde_json::to_vec(proof).expect("payment proof should serialize");
-    STANDARD.encode(serialized)
-}
-
-fn decode_payment_proof(encoded: &str) -> Result<PaymentProof, String> {
-    let raw = STANDARD.decode(encoded).map_err(|err| err.to_string())?;
-    serde_json::from_slice::<PaymentProof>(&raw).map_err(|err| err.to_string())
+    response
 }
 
 pub fn mark_request(metrics: &Metrics, endpoint: &str, status: StatusCode) {

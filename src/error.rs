@@ -7,7 +7,7 @@ use serde::Serialize;
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::types::{PaymentRequired, X402_VERSION_HEADER};
+use crate::types::{PAYMENT_REQUIRED_HEADER, PaymentRequired, X402_VERSION_HEADER};
 
 pub type ApiResult<T> = Result<T, ApiError>;
 
@@ -157,10 +157,17 @@ impl IntoResponse for ApiError {
 }
 
 fn payment_required_response(payload: PaymentRequired) -> Response {
+    let payment_required = payload.payment_required.clone();
     let mut response = (StatusCode::PAYMENT_REQUIRED, Json(payload)).into_response();
     response.headers_mut().insert(
         HeaderName::from_static(X402_VERSION_HEADER),
         HeaderValue::from_static("2"),
     );
+    if let Ok(header_value) = HeaderValue::from_str(&payment_required) {
+        response.headers_mut().insert(
+            HeaderName::from_static(PAYMENT_REQUIRED_HEADER),
+            header_value,
+        );
+    }
     response
 }

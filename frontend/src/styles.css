@@ -736,6 +736,9 @@ body {
   grid-template-columns: repeat(4, 1fr);
   gap: 16px;
   margin-bottom: 16px;
+  min-height: 200px;
+  align-items: center;
+  justify-items: center;
 }
 
 .campaign-item {
@@ -1402,6 +1405,12 @@ td {
   padding: 40px;
   color: var(--text-secondary);
   font-size: 14px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 200px;
+  width: 100%;
+  grid-column: 1 / -1; /* Span all columns in grid */
 }
 
 /* Responsive */

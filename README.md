@@ -31,9 +31,13 @@ Set env:
 
 ```bash
 export DATABASE_URL=postgres://postgres:postgres@localhost:5432/payloadexchange
-export TESTNET_RPC_URL=https://your-testnet-rpc.example
-export TESTNET_CONFIRMED_TX_HASH=0x<confirmed_testnet_tx_hash>
-export TESTNET_FAILED_TX_HASH=0x<failed_testnet_tx_hash>
+export X402_FACILITATOR_URL=https://x402.org/facilitator
+export X402_VERIFY_PATH=/verify
+export X402_SETTLE_PATH=/settle
+export X402_NETWORK=base-sepolia
+export X402_PAY_TO=0x<seller_wallet_address>
+export X402_ASSET=0x<testnet_usdc_asset_address>
+export PUBLIC_BASE_URL=http://localhost:3000
 ```
 
 Run app:
@@ -134,17 +138,17 @@ curl -s -X POST http://localhost:3000/proxy/scraping/run \
 5. Direct user payment flow (no sponsor)
 
 ```bash
-curl -s -X POST http://localhost:3000/payments/testnet/direct \
+curl -si -X POST http://localhost:3000/tool/design/run \
   -H 'content-type: application/json' \
-  -d '{"payer":"dev@example.com","service":"design","tx_hash":"0x<TESTNET_TX_HASH>"}'
+  -d '{"user_id":"<USER_ID>","input":"generate landing page options"}'
 ```
 
-Use returned `payment_signature` as `payment-signature` header:
+Server returns `402` plus `PAYMENT-REQUIRED` header. Create an x402 payment signature from that challenge, then retry:
 
 ```bash
 curl -s -X POST http://localhost:3000/tool/design/run \
   -H 'content-type: application/json' \
-  -H 'payment-signature: <PAYMENT_SIGNATURE>' \
+  -H 'payment-signature: <BASE64_PAYMENT_SIGNATURE>' \
   -d '{"user_id":"<USER_ID>","input":"generate landing page options"}'
 ```
 
@@ -178,12 +182,12 @@ curl -s http://localhost:3000/metrics
 
 ## Testnet Tests (No Mock)
 
-Tests in `src/test.rs` call the real testnet verification path and require RPC + real tx hashes:
+Tests in `src/test.rs` use real x402 verifier/settler HTTP calls. Live tests require:
 
 ```bash
-export TESTNET_RPC_URL=https://your-testnet-rpc.example
-export TESTNET_CONFIRMED_TX_HASH=0x<confirmed_testnet_tx_hash>
-export TESTNET_FAILED_TX_HASH=0x<failed_testnet_tx_hash>
+export X402_PAY_TO=0x<seller_wallet_address>
+export X402_ASSET=0x<testnet_usdc_asset_address>
+export TESTNET_PAYMENT_SIGNATURE_DESIGN=<BASE64_PAYMENT_SIGNATURE_FOR_/tool/design/run>
 cargo test testnet_ -- --nocapture
 ```
 
